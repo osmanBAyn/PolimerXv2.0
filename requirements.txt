@@ -19,3 +19,4 @@ datasets
 xgboost
 lightgbm
 ipython_genutils
+matplotlib
