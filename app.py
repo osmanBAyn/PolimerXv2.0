@@ -28,7 +28,7 @@ import selfies as sf
 from datasets import load_dataset
 import rdkit.Chem.rdChemReactions as rdChemReactions
 # import stmol as showmol # 3D görselleştirme kütüphanesi (varsa)
-
+import sys
 RDLogger.DisableLog('rdApp.*')
 from rdkit.Chem import Draw
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -43,10 +43,15 @@ def load_my_trained_model():
 # Buraya az önce oluşturduğun Hugging Face modelinin adını yaz
     model_path = "OsBaran/POLISEN_T5_Model"
     try:
+        print("--- [LOG] Model yükleme fonksiyonu başladı...", flush=True) # EKLE
+
         tokenizer = AutoTokenizer.from_pretrained(model_path)
+        print("--- [LOG] Tokenizer yüklendi. Model yükleniyor...", flush=True) # EKLE
+
         model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
         model.eval()  # Modeli değerlendirme moduna al
-    
+        print("--- [LOG] Model Quantization işlemi yapılıyor...", flush=True) # EKLE
+
     # Modeli sıkıştır (Quantization)
     # Bu işlem CPU'da çalışmayı İNANILMAZ hızlandırır
         model = torch.quantization.quantize_dynamic(
@@ -54,6 +59,8 @@ def load_my_trained_model():
             {torch.nn.Linear}, 
             dtype=torch.qint8
         )
+        print("--- [LOG] Model başarıyla hafızaya alındı! Hazır.", flush=True) # EKLE
+
         return tokenizer, model
     except Exception as e:
         st.error(f"Model yüklenemedi: {e}")
@@ -65,6 +72,8 @@ def predict_monomers_local(polymer_smiles):
     Eğer sonuç başarısızsa kural tabanlı motoru devreye sokar.
     """
     # 1. MODEL TAHMİNİ
+    print(f"--- [LOG] {time.strftime('%X')} - Girdi (Input) hazırlanıyor...", flush=True)
+
     tokenizer, model = load_my_trained_model()
     ai_prediction = ""
     
@@ -73,16 +82,28 @@ def predict_monomers_local(polymer_smiles):
             # Eğitimde kullandığımız "retrosynthesis: " ön ekini unutmuyoruz!
             input_text = "retrosynthesis: " + polymer_smiles
             inputs = tokenizer(input_text, return_tensors="pt")
-            
+            print(f"--- [LOG] {time.strftime('%X')} - MODEL GENERATE BAŞLIYOR (Burada bekleyebilir)...", flush=True)
+            start_time = time.time()
+
             # Tahmin üret
             outputs = model.generate(
                 inputs["input_ids"], 
-                max_length=128, 
+                max_length=64, 
                 num_beams=1,
                 do_sample=False,# En iyi 5 yolu ara
-                early_stopping=True
+                early_stopping=True,
+                num_return_sequences=1
             )
             ai_prediction = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            end_time = time.time()
+            print(f"--- [LOG] {time.strftime('%X')} - MODEL GENERATE BİTTİ! Geçen süre: {round(end_time - start_time, 2)} saniye.", flush=True)
+            
+            # 3. Decode İşlemi
+            print(f"--- [LOG] {time.strftime('%X')} - Çıktı okunuyor (Decode)...", flush=True)
+            # result = tokenizer.decode(...) kodun burada
+            
+            print("--- [LOG] İşlem başarıyla tamamlandı.", flush=True)
+            st.success("Bitti!")
         except:
             ai_prediction = ""
 
@@ -2271,6 +2292,7 @@ if models:
                     # Session State'e kaydet (PDF raporu için)
 
                     st.session_state['retro_manual_text'] = f"AI Tahmini: {prediction}"
+
 
 
 
