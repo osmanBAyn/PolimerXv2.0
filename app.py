@@ -41,7 +41,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 @st.cache_resource
 def load_my_trained_model():
 # Buraya az önce oluşturduğun Hugging Face modelinin adını yaz
-    model_path = "OsBaran/POLISEN_T5_Model"
+    model_path = "OsBaran/POLSEN_T5"
     try:
         print("--- [LOG] Model yükleme fonksiyonu başladı...", flush=True) # EKLE
 
@@ -89,10 +89,10 @@ def predict_monomers_local(polymer_smiles):
             outputs = model.generate(
                 inputs["input_ids"], 
                 max_length=64, 
-                num_beams=1,
-                do_sample=False,# En iyi 5 yolu ara
+                num_beams=5,
+                # do_sample=False,# En iyi 5 yolu ara
                 early_stopping=True,
-                num_return_sequences=1
+                # num_return_sequences=1
             )
             ai_prediction = tokenizer.decode(outputs[0], skip_special_tokens=True)
             end_time = time.time()
@@ -2292,6 +2292,7 @@ if models:
                     # Session State'e kaydet (PDF raporu için)
 
                     st.session_state['retro_manual_text'] = f"AI Tahmini: {prediction}"
+
 
 
 
