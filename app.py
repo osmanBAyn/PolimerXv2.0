@@ -21,6 +21,7 @@ from deap import algorithms
 import lightgbm as lgbm
 # Kimya kütüphaneleri
 from rdkit import Chem
+import torch
 from rdkit.Chem import AllChem
 from rdkit import RDLogger
 import selfies as sf
@@ -2270,5 +2271,6 @@ if models:
                     # Session State'e kaydet (PDF raporu için)
 
                     st.session_state['retro_manual_text'] = f"AI Tahmini: {prediction}"
+
 
 
