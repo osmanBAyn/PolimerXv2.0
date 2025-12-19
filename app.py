@@ -44,6 +44,15 @@ def load_my_trained_model():
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+        model.eval()  # Modeli değerlendirme moduna al
+    
+    # Modeli sıkıştır (Quantization)
+    # Bu işlem CPU'da çalışmayı İNANILMAZ hızlandırır
+        model = torch.quantization.quantize_dynamic(
+            model, 
+            {torch.nn.Linear}, 
+            dtype=torch.qint8
+        )
         return tokenizer, model
     except Exception as e:
         st.error(f"Model yüklenemedi: {e}")
@@ -68,7 +77,8 @@ def predict_monomers_local(polymer_smiles):
             outputs = model.generate(
                 inputs["input_ids"], 
                 max_length=128, 
-                num_beams=5,           # En iyi 5 yolu ara
+                num_beams=1,
+                do_sample=False,# En iyi 5 yolu ara
                 early_stopping=True
             )
             ai_prediction = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -2260,4 +2270,5 @@ if models:
                     # Session State'e kaydet (PDF raporu için)
 
                     st.session_state['retro_manual_text'] = f"AI Tahmini: {prediction}"
+
 
