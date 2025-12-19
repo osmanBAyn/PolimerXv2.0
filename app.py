@@ -111,25 +111,24 @@ def predict_monomers_local(polymer_smiles):
             # result = tokenizer.decode(...) kodun burada
             
             print("--- [LOG] İşlem başarıyla tamamlandı.", flush=True)
-            st.success("Bitti!")
         except:
             ai_prediction = ""
 
     # 2. SONUÇ KONTROLÜ VE HİBRİT KARAR
     # Model mantıklı bir şey (örneğin nokta ile ayrılmış iki parça) döndürdü mü?
     if ai_prediction and " . " in ai_prediction:
-        return f"{ai_prediction} (Yerel AI Modeli)"
+        return f"{ai_prediction} (T5 Modeli)"
     
     # Model başarısızsa veya emin değilse KURAL MOTORUNU çağır
     else:
         rules = decompose_polymer(polymer_smiles) # Mevcut fonksiyonun
         if rules:
             monomers = rules[0]['monomers']
-            return f"{' . '.join(monomers)} (Kural Tabanlı - Yedek)"
+            return f"{' . '.join(monomers)} (Kural Tabanlı)"
         else:
             # Model bir şey buldu ama nokta yoksa yine de gösterelim (belki tek monomerdir)
             if ai_prediction:
-                return f"{ai_prediction} (AI Modeli - Tek Parça)"
+                return f"{ai_prediction} (T5 Modeli)"
             return "Ayrıştırılamadı"
 # --- YAYGIN ÇÖZÜCÜLER REFERANS LİSTESİ ---
 COMMON_SOLVENTS = {
@@ -2273,7 +2272,7 @@ if models:
             st.divider()
 
             # --- 2. YEREL MODEL TAHMİNİ (GEMINI YERİNE) ---
-            st.subheader("2. T5-Model Tahmini (Machine Learning)")
+            st.subheader("2. T5-Model Tahmini ")
             st.caption("Eğittiğimiz model, moleküler yapıyı analiz ederek monomerleri tahmin ediyor.")
 
             if st.button("Monomerleri Tahmin Et", type="primary"):
@@ -2282,7 +2281,7 @@ if models:
                     prediction = predict_monomers_local(best_poly_data['smiles'])
                     
                     # Sonucu Göster
-                    st.success("Tahmin Başarılı!")
+                    st.success("Monomer Tahmini Başarılı!")
                     
                     st.markdown(f"""
                     <div style="background-color:#e8f5e9; padding:15px; border-radius:10px; border:1px solid #4CAF50;">
