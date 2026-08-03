@@ -62,8 +62,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ---- app ------------------------------------------------------------------------------
 COPY . .
 
-# Port 8501, exactly as the previously-working image. $PORT is honoured when the platform
-# injects one; PORT is deliberately NOT given a default via ENV, because an ENV default would
-# shadow the value the platform sets and send Streamlit to the wrong port.
+# Port: FIXED at 8501, matching the previously-working image and the platform's routing.
+#
+# Do NOT switch this to ${PORT}. Railway injects PORT=8080, but its HTTP router for this
+# service targets 8501 (inherited from the original image, whose CMD passed no --server.port
+# and therefore used Streamlit's 8501 default). Honouring $PORT moved Streamlit to 8080 while
+# the router kept probing 8501 -> nothing listening -> 502. The deploy log makes this visible:
+# it printed "URL: http://0.0.0.0:8080" while the site was down.
+#
+# If the service is ever reconfigured to target a different port, change BOTH lines below.
 EXPOSE 8501
-CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false"]
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--browser.gatherUsageStats=false"]
