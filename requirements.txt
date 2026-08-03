@@ -16,6 +16,10 @@ huggingface-hub==0.36.0
 pubchempy==1.0.5
 stmol==0.0.9
 py3Dmol==2.5.3
+# stmol pins ipywidgets==7.6.3, which IMPORTS ipython_genutils but does not DECLARE it,
+# so pip never installs it and the app dies with ModuleNotFoundError at import time.
+ipywidgets==7.6.3
+ipython_genutils==0.2.0
 fpdf==1.7.2
 plotly==6.5.0
 matplotlib==3.10.8

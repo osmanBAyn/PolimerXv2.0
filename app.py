@@ -9,8 +9,17 @@ import json
 import functools
 import time
 import math
-from stmol import showmol
-import py3Dmol
+# 3D viewer is OPTIONAL. stmol pulls a fragile Jupyter-era dependency chain
+# (ipywidgets 7.6.3 -> ipython_genutils, which it imports without declaring), so a
+# missing piece must degrade to "no 3D view" rather than take the whole app down.
+try:
+    from stmol import showmol
+    import py3Dmol
+    _HAS_3D = True
+except Exception as _e3d:                      # noqa: BLE001 - any import failure disables 3D
+    showmol = None
+    py3Dmol = None
+    _HAS_3D = False
 import pubchempy as pcp
 import deap.base as base
 import deap.creator as creator
@@ -2039,6 +2048,8 @@ def make_3d_view_with_reason(smiles):
         except:
             return None, "3D yapı enerji optimizasyonunda başarısız."
         
+        if not _HAS_3D:
+            return None, "3D görüntüleyici bu sunucuda kurulu değil."
         mblock = Chem.MolToMolBlock(mol)
         view = py3Dmol.view(width=400, height=400)
         view.addModel(mblock, 'mol')
@@ -3333,7 +3344,8 @@ if models:
                 st.subheader(f"{_('3d_structure')}")
                 view, reason = make_3d_view_with_reason(best_poly_data["smiles"])
                 if view:
-                    showmol(view, height=400, width=400)
+                    if _HAS_3D:
+                        showmol(view, height=400, width=400)
                 else:
                     st.warning(f"3D Model oluşturulamadı: {reason}")
             
