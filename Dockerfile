@@ -1,9 +1,9 @@
-# Polsen — container image (Railway, Fly, Render, any Docker host)
+# Polsen — container image (Railway / any Docker host)
 #
-# Railway uses this Dockerfile automatically when it is present in the repo root.
-# It installs the OFFICIAL xtb Linux binary (27 MB, LGPL-3.0-or-later) so the quantum
-# verification panel works in production. The app does not require xtb — if this step is
-# removed the panel simply auto-hides — so it is safe to drop for a slimmer image.
+# Derived from the previously-working image: SAME system libraries and SAME port (8501).
+# Only two deliberate changes: the explicit PyTorch install is gone (USE_T5_RETRO is off, so
+# torch is unused and cost ~2.8 GB), and the official xtb binary is added for the quantum
+# verification panel.
 
 FROM python:3.11-slim
 
@@ -11,25 +11,43 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# ---- system deps -------------------------------------------------------------------
-# curl+xz to fetch/unpack xtb; libgomp1 is xtb's OpenMP runtime.
+# System libraries.
+#  - libxrender1 / libxext6 / libsm6 / libx11-dev / libgl1 are REQUIRED by RDKit. Without
+#    them RDKit fails to import ("libXrender.so.1: cannot open shared object file") and the
+#    container dies at startup — which is a 502 at the edge.
+#  - build-essential / git are kept from the previous working image so that any package
+#    without a prebuilt wheel can still compile.
+#  - curl / xz-utils / libgomp1 are needed to fetch and run xtb.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl xz-utils libgomp1 ca-certificates \
+        build-essential \
+        git \
+        libxrender1 \
+        libxext6 \
+        libsm6 \
+        libx11-dev \
+        libgl1 \
+        libgomp1 \
+        curl \
+        xz-utils \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- xtb (GFN2 quantum cross-check) --------------------------------------------------
-# Pinned version + published SHA256 so the build is reproducible and tamper-evident.
+# Official Linux binary, version-pinned and checksum-verified. Deliberately NON-FATAL: the
+# app never requires xtb (the verification panel auto-hides when it is missing), so a network
+# hiccup here must not take the whole deployment down.
 ARG XTB_VERSION=6.7.1
 ARG XTB_SHA256=62a8d18778286e815292ee53d76ce447daf460a4dea3782c0f25cbac7019b5df
-RUN set -eux; \
-    curl -fsSL -o /tmp/xtb.tar.xz \
-      "https://github.com/grimme-lab/xtb/releases/download/v${XTB_VERSION}/xtb-${XTB_VERSION}-linux-x86_64.tar.xz"; \
-    echo "${XTB_SHA256}  /tmp/xtb.tar.xz" | sha256sum -c -; \
-    mkdir -p /opt && tar -xJf /tmp/xtb.tar.xz -C /opt; \
-    rm /tmp/xtb.tar.xz; \
-    /opt/xtb-dist/bin/xtb --version
+RUN set -eu; \
+    ( curl -fsSL -o /tmp/xtb.tar.xz \
+        "https://github.com/grimme-lab/xtb/releases/download/v${XTB_VERSION}/xtb-${XTB_VERSION}-linux-x86_64.tar.xz" \
+      && echo "${XTB_SHA256}  /tmp/xtb.tar.xz" | sha256sum -c - \
+      && mkdir -p /opt && tar -xJf /tmp/xtb.tar.xz -C /opt \
+      && /opt/xtb-dist/bin/xtb --version \
+      && echo "xtb installed OK" ) \
+    || echo "WARNING: xtb install skipped — the app will run with the verification panel hidden"; \
+    rm -f /tmp/xtb.tar.xz
 
-# xtb finds its parameter files through XTBPATH; appv3 finds the binary through XTB_EXE.
 ENV PATH="/opt/xtb-dist/bin:${PATH}" \
     XTBPATH="/opt/xtb-dist/share/xtb" \
     XTB_EXE="/opt/xtb-dist/bin/xtb" \
@@ -44,7 +62,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ---- app ------------------------------------------------------------------------------
 COPY . .
 
-# Railway injects $PORT; default to 8080 for local `docker run`.
-ENV PORT=8080
-EXPOSE 8080
-CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8080} --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false"]
+# Port 8501, exactly as the previously-working image. $PORT is honoured when the platform
+# injects one; PORT is deliberately NOT given a default via ENV, because an ENV default would
+# shadow the value the platform sets and send Streamlit to the wrong port.
+EXPOSE 8501
+CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false"]
