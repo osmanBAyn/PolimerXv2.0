@@ -4,6 +4,9 @@ import pandas as pd
 import joblib
 import random
 import operator
+import os
+import json
+import functools
 import time
 import math
 from stmol import showmol
@@ -48,10 +51,29 @@ from lang_dict import LANGUAGES
 # =====================================================================================
 # CONFIG -- toggle app features here (safe to edit before publishing)
 # =====================================================================================
-SHOW_RELIABILITY = False    # show per-property model-reliability badges + legend + warnings
+SHOW_RELIABILITY = True    # per-property reliability badges + legend + warnings AND the
+                            #   "± typical error" bars on values (and their export columns)
+SHOW_APPLICABILITY = True   # applicability-domain banner: warn when the polymer is outside
+                            #   the training distribution (extrapolation) -- see PROP_MAE/AD_*
 SHOW_MANUAL_ANALYSIS = True  # show the "Manual Polymer Analysis" expander
 SHOW_PARETO_TABLE = True   # show the Pareto-front table/plot in the Evolution tab (NSGA-II)
-USE_T5_RETRO = True       # try the (heavy) T5 retro model; off = rule engine only (recommended for deploy)
+TOP_N_CANDIDATES = 8       # how many runner-up polymers to surface alongside the best one
+                           #   (0 hides the section; the winner is often not the most practical)
+SHOW_BLENDS = True         # Blend tab: real materials are usually blends/alloys, not neat
+                           #   homopolymers -- miscibility screen + blend property estimates
+SHOW_CHEM_REVIEW = True    # chemist-facing validity notes (meaningless Tm on an amorphous
+                           #   polymer, reactive group pairs, architecture caveats, ...)
+USE_T5_RETRO = False      # OFF for deployment: the T5 was trained on synthetic data and does
+                          #   not generalise to GA outputs, while the rule engine alone reaches
+                          #   ~92% verified / 0% wrong. Turning it on also makes torch (~2.8 GB)
+                          #   + transformers hard dependencies and downloads the model at start.
+USE_BAGGED_UNCERTAINTY = True   # load the bagged companion ensembles in models_bagged/ to give
+                          #   molecule-specific error bars for Td/Tm/band gaps/Hansen. Adds ~43 MB
+                          #   of lazily-loaded models; set False for a lightweight deploy (the
+                          #   app then falls back to the global measured MAE for those).
+ENABLE_XTB = True         # in Manual Analysis, offer a GFN2-xTB quantum cross-check of the band gap
+                          #   & polarizability. Auto-hides where the xtb executable isn't installed
+                          #   (e.g. Streamlit Cloud), so it's safe to leave on. See validation/XTB_VALIDATION.md.
 
 # set_page_config MUST be the first Streamlit command that renders anything,
 # so it comes before the sidebar language selector below.
@@ -67,6 +89,26 @@ if "lang" not in st.session_state:
 # Çeviri 
 def _(text_key):
     return LANGUAGES[st.session_state["lang"]].get(text_key, text_key)
+
+
+# retro.py is UI-agnostic and emits English route names/mechanisms. Translate them for
+# display, handling the suffixes retro appends for branched units (so a composed string
+# like "Polyester (branched/crosslinked)" translates in both halves).
+_RETRO_SUFFIXES = (" (branched/crosslinked)",
+                   "; crosslinked/branched at the extra connection point(s)")
+
+
+def tr_retro(text):
+    """Translate a retro route 'type'/'mechanism' string (identity when already translated)."""
+    if not text:
+        return text
+    hit = _(text)
+    if hit != text:
+        return hit
+    for suf in _RETRO_SUFFIXES:
+        if text.endswith(suf):
+            return tr_retro(text[:-len(suf)]) + _(suf)
+    return text
 
 st.sidebar.markdown("### 🌍 Dil / Language")
 selected_lang = st.sidebar.selectbox(
@@ -609,12 +651,244 @@ MODEL_RELIABILITY = {
     'Td': 'high', 'Tm': 'high', 'GasPerma': 'high', 'Hansen': 'high', 'Degradability': 'high',
     'ThermalCond': 'medium',
     'EPS': 'medium',   # retrained on the CLEAN dataset6 EPS data (R2~0.69); old model used a corrupt split
-    # Refractive v2 (MolMR + cleaned data) scores R2~0.82 on the dataset's held-out test,
-    # but generalises poorly to tiny canonical repeat units (data-source issue) -> medium.
-    'Refractive': 'medium',
+    # Refractive is now computed analytically (van Krevelen), NOT by the ML model: MAE 0.034 and
+    # Spearman 0.93 against literature on canonical polymers, vs 0.179/0.54 for the ML model,
+    # which returned ~1.70 for everything. See ANALYTIC_PROPS and validation/APP_TEST_REPORT.md.
+    'Refractive': 'high',
     'CTE': 'low', 'Recyclability': 'low',
 }
 RELIABILITY_BADGE = {'high': '🟢', 'medium': '🟡', 'low': '🟠', 'unreliable': '🔴'}
+
+# Physical unit shown next to each predicted value (empty = dimensionless).
+PROP_UNITS = {
+    'Tg': '°C', 'Td': '°C', 'Tm': '°C',
+    'EPS': '',                     # dielectric constant (dimensionless)
+    'BandgapBulk': 'eV', 'BandgapChain': 'eV', 'BandgapCrystal': 'eV',
+    'GasPerma': 'Barrer',
+    'Refractive': '',              # refractive index (dimensionless)
+    'LOI': '%',
+    'Solubility': '(cal/cm³)^½',   # Hildebrand solubility parameter
+    'ThermalCond': 'W/m·K',
+    'CTE': 'ppm/K',
+    'Recyclability': 'kJ/mol',     # ~ enthalpy of polymerisation
+    'Degradability': '',           # degradability score
+    'Hansen': 'MPa^½',             # Hansen solubility parameter
+}
+
+
+# --- Analytic (non-ML) predictors ---------------------------------------------------
+# Refractive index is computed by van Krevelen group contribution instead of the ML model.
+# Why: on canonical polymers with known literature values the ML model's whole output range is
+# 0.072 while the true range is 0.28 -- it returns ~1.70 for everything, so it cannot tell a
+# fluoropolymer from a polysulfone and the GA cannot optimise against it. Measured on those
+# polymers: ML MAE 0.179 / Spearman 0.54, van Krevelen MAE 0.034 / Spearman 0.93 (5.3x better).
+# See validation/APP_TEST_REPORT.md. The ML model stays loaded purely as a fallback.
+ANALYTIC_PROPS = {'Refractive'}
+
+
+@functools.lru_cache(maxsize=50000)
+def _vk_refractive(s_smiles):
+    """van Krevelen refractive index; None if the structure can't be tiled into groups."""
+    try:
+        import van_krevelen as _vkmod
+        est = _vkmod.vk_estimate(s_smiles)
+        v = est.get('Refractive') if isinstance(est, dict) else None
+        # Sanity gate. Real organic polymers span ~1.29 (fluoropolymers) to ~1.78 (sulfur-rich);
+        # van Krevelen over-estimates for heavily hydroxylated units (a polyol read 1.93), so
+        # anything outside this window falls back to the ML model instead of shipping nonsense.
+        return float(v) if v is not None and 1.25 <= v <= 1.80 else None
+    except Exception:
+        return None
+
+
+def prop_unit(prop):
+    return PROP_UNITS.get(prop, '')
+
+
+# Typical error to expect on a NEW polymer, per property. Only properties with a measured
+# number appear here -- the rest show no error bar rather than an invented one.
+#   'gold' = out-of-sample MAE on 18 canonical handbook polymers (validation/golden_set.py);
+#            the most honest number, since those polymers sit outside the training distribution.
+#   'held' = 20% hold-out MAE measured by validation/train_bagged.py -- a genuine out-of-sample
+#            number, but in-distribution, so it is optimistic relative to 'gold'.
+#   'in'   = in-sample only (most optimistic -- treat as a lower bound).
+# Preference order gold > held > in: where both exist we keep the more conservative 'gold'.
+PROP_MAE = {
+    'LOI':         (3.3,  'gold'),
+    'Solubility':  (0.84, 'gold'),
+    'Tg':          (44.0, 'gold'),
+    'Tm':          (45.0, 'gold'),
+    'Refractive':  (0.034, 'gold'),  # van Krevelen (was 0.18 for the ML model)
+    'EPS':         (1.04, 'gold'),
+    'ThermalCond': (0.055, 'gold'),
+    'CTE':         (32.5, 'gold'),
+    'Td':            (45.3,  'held'),   # was 64.0 in-sample; 45.3 is the measured hold-out
+    'BandgapBulk':   (0.10,  'held'),
+    'BandgapChain':  (0.28,  'held'),
+    'BandgapCrystal': (0.06, 'held'),
+    'Hansen':        (0.89,  'held'),
+    'Degradability': (0.08,  'held'),
+    'GasPerma':      (3.3,   'held'),   # FOLD factor, see FOLD_PROPS
+}
+
+# Properties fitted on log10(value): their error is multiplicative, so it is shown as
+# "x/÷ 3.3" (a fold factor) rather than a meaningless symmetric "± 3.3 Barrer".
+FOLD_PROPS = {'GasPerma'}
+
+
+def prop_error(prop):
+    """(mae, source) for a property, or (None, None) when we have no measured error."""
+    return PROP_MAE.get(prop, (None, None))
+
+
+# --- Per-prediction (molecule-specific) uncertainty ---------------------------------
+# Built by validation/calibrate_uncertainty.py. A property appears here ONLY if its
+# model-internal spread was shown to track the actual error on a real sample -- both a rank
+# correlation (rho >= 0.30) AND a real effect size (top-spread quartile at least 1.5x the
+# error of the bottom one). Everything else keeps the global golden-set MAE, because a
+# per-molecule number that does not predict error is worse than an honest average.
+# Measured: Refractive rho=+0.95 (6.0x), Solubility rho=+0.57 (2.6x).
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+@st.cache_resource(show_spinner=False)
+def _load_uncertainty_calibration():
+    """
+    Merge two calibration sources:
+      validation/uncertainty_calibration.json  - signals internal to the DEPLOYED models
+                                                 (RF tree spread / boosting-staged spread)
+      models_bagged/companion_calibration.json - bagged "companion" ensembles trained by
+                                                 validation/train_bagged.py. Predictions still
+                                                 come from the deployed models (no accuracy
+                                                 risk); the bag is consulted only for spread,
+                                                 and only for properties where that spread was
+                                                 shown to predict the DEPLOYED model's error.
+    """
+    cal = {}
+    for rel in ("validation/uncertainty_calibration.json",
+                "models_bagged/companion_calibration.json"):
+        try:
+            with open(os.path.join(_APP_DIR, *rel.split("/")), encoding="utf-8") as fh:
+                cal.update(json.load(fh))
+        except Exception:
+            continue
+    if not USE_BAGGED_UNCERTAINTY:
+        cal = {k: v for k, v in cal.items() if not v.get("companion")}
+    # An analytic property is no longer predicted by its ML model, so that model's internal
+    # spread says nothing about the value we now report -- drop it rather than mislead.
+    return {k: v for k, v in cal.items() if k not in ANALYTIC_PROPS}
+
+
+@st.cache_resource(show_spinner=False)
+def _load_companion(prop):
+    """Lazily load one bagged companion (~5-9 MB); None when absent."""
+    path = os.path.join(_APP_DIR, "models_bagged", f"bagged_{prop}.joblib")
+    if not USE_BAGGED_UNCERTAINTY or not os.path.exists(path):
+        return None
+    try:
+        import bagged_model  # noqa: F401  (defines BaggedEnsemble for unpickling)
+    except Exception:
+        pass
+    try:
+        return joblib.load(path)
+    except Exception:
+        return None
+
+
+UNC_CAL = _load_uncertainty_calibration()
+UNC_MIN_MULT, UNC_MAX_MULT = 0.45, 2.0     # how far a molecule may move off the global MAE
+
+
+def _spread_for(prop, s_smiles):
+    """Model-internal spread for one molecule, using the method its calibration specifies."""
+    cal = UNC_CAL.get(prop)
+    mdl = models.get(prop) if isinstance(models, dict) else None
+    if not cal or mdl is None:
+        return None
+    X = _features_for(prop, s_smiles)
+    if X is None:
+        return None
+    if cal.get("companion"):
+        # spread from the bagged companion; the PREDICTION still comes from the deployed model
+        bag = _load_companion(prop)
+        if bag is None:
+            return None
+        try:
+            return float(np.std([e.predict(X)[0] for e in bag.estimators_]))
+        except Exception:
+            return None
+    try:
+        if cal["method"] == "ensemble":
+            est = getattr(mdl, "estimators_", None)
+            if not est:
+                return None
+            return float(np.std([t.predict(X)[0] for t in est]))
+        inner = mdl.steps[-1][1] if hasattr(mdl, "steps") else mdl
+        inner = getattr(inner, "regressor_", inner)
+        try:
+            n = inner.get_booster().num_boosted_rounds()
+        except Exception:
+            n = getattr(inner, "n_estimators", None)
+        if not n or n < 20:
+            return None
+        preds = []
+        for f in (0.40, 0.55, 0.70, 0.85, 1.0):
+            k = max(1, int(n * f))
+            try:
+                preds.append(float(mdl.predict(X, iteration_range=(0, k))[0]))
+            except Exception:
+                preds.append(float(mdl.predict(X, num_iteration=k)[0]))
+        return float(np.std(preds))
+    except Exception:
+        return None
+
+
+def prop_error_for(prop, s_smiles=None):
+    """
+    (error, source) for ONE molecule. Returns the molecule-specific value where the signal
+    was validated ('mol'), otherwise the global measured MAE ('gold'/'in').
+    The spread is mapped through the calibration quartiles onto a bounded multiplier of the
+    global MAE, so a settled prediction tightens the bar and an unsettled one widens it.
+    """
+    mae, src = prop_error(prop)
+    if mae is None or not s_smiles or prop not in UNC_CAL:
+        return mae, src
+    sp = _spread_for(prop, s_smiles)
+    if sp is None:
+        return mae, src
+    cal = UNC_CAL[prop]
+    q25, q50, q75 = cal["q25"], cal["q50"], cal["q75"]
+    if sp <= q25:
+        mult = UNC_MIN_MULT + (0.85 - UNC_MIN_MULT) * (sp / q25 if q25 else 1.0)
+    elif sp <= q50:
+        mult = 0.85 + 0.15 * ((sp - q25) / max(q50 - q25, 1e-9))
+    elif sp <= q75:
+        mult = 1.0 + 0.35 * ((sp - q50) / max(q75 - q50, 1e-9))
+    else:
+        mult = 1.35 + (UNC_MAX_MULT - 1.35) * min(1.0, (sp - q75) / max(q75, 1e-9))
+    mult = max(UNC_MIN_MULT, min(UNC_MAX_MULT, mult))
+    if prop in FOLD_PROPS:
+        # a fold factor scales in LOG space: 3.3x at mult=2 is 10.9x, not 6.6x
+        return float(10 ** (np.log10(max(mae, 1.0000001)) * mult)), 'mol'
+    return mae * mult, 'mol'
+
+
+# --- Applicability domain -----------------------------------------------------------
+# Max Tanimoto similarity to the training set. Below ~0.4 the models are extrapolating and
+# their absolute values (especially Refractive/EPS, which revert to the mean out-of-domain)
+# should not be trusted. Thresholds chosen from the golden-set analysis.
+AD_GOOD, AD_WARN = 0.55, 0.35
+
+
+def applicability(max_sim):
+    """-> ('in'|'edge'|'out', emoji) from the nearest-training-set similarity."""
+    if max_sim is None:
+        return 'edge', '🟡'
+    if max_sim >= AD_GOOD:
+        return 'in', '🟢'
+    if max_sim >= AD_WARN:
+        return 'edge', '🟡'
+    return 'out', '🟠'
 
 
 def cxSelfies(ind1, ind2):
@@ -662,6 +936,7 @@ def compute_preds(s_smiles, models, props):
     """
     Run every requested property model for one molecule and return {prop: value}.
     Each property uses its own feature extractor (see appv2 feature helpers).
+    Properties in ANALYTIC_PROPS bypass their ML model (see above).
     Returns None if the base fingerprint can't be built.
     """
     # Two Morgan fingerprints: replace-'*' (default) and keep-'*'. Each property's
@@ -695,7 +970,11 @@ def compute_preds(s_smiles, models, props):
         elif prop == 'Hansen':
             preds[prop] = models[prop].predict(han_features)[0] if han_features is not None else 0.0
         elif prop == 'Refractive':
-            preds[prop] = models[prop].predict(ref_features)[0] if ref_features is not None else 0.0
+            _vkri = _vk_refractive(s_smiles)          # van Krevelen first (see ANALYTIC_PROPS)
+            if _vkri is not None:
+                preds[prop] = _vkri
+            else:                                     # fall back to the ML model
+                preds[prop] = models[prop].predict(ref_features)[0] if ref_features is not None else 0.0
         elif prop == 'EPS':
             preds[prop] = models[prop].predict(eps_features)[0] if eps_features is not None else 0.0
         elif prop in KEEP_STAR_FP:
@@ -714,6 +993,23 @@ _PROP_FEATURE = {
     'Degradability': 'deg', 'Recyclability': 'rec',
 }
 _PROP_POST = {'GasPerma': lambda v: 10 ** v}   # model predicts log10(Barrer)
+
+
+def _features_for(prop, s_smiles):
+    """Feature matrix for one molecule, routed exactly as compute_preds does."""
+    key = _PROP_FEATURE.get(prop)
+    try:
+        if key == '_fp':  return get_morgan_fp(s_smiles, keep_star=False)
+        if key == '_fpk': return get_morgan_fp(s_smiles, keep_star=True)
+        if key == 'gas':  return get_gas_features_combined(s_smiles)
+        if key == 'eps':  return get_eps_features(s_smiles)
+        if key == 'ref':  return get_refractive_features(s_smiles)
+        if key == 'han':  return get_hansen_features(s_smiles)
+        if key == 'deg':  return get_degradability_features(s_smiles)
+        if key == 'rec':  return get_recyclability_features(s_smiles)
+    except Exception:
+        return None
+    return None
 
 
 def compute_preds_batch(smiles_list, models, active_props):
@@ -748,8 +1044,25 @@ def compute_preds_batch(smiles_list, models, active_props):
             return None
         return None if f is None else np.asarray(f).reshape(-1)
 
-    # which feature-keys do we actually need?
-    keys_needed = {_PROP_FEATURE[p] for p in active_props if p in _PROP_FEATURE and p in models}
+    # Analytic properties bypass their ML model entirely (see ANALYTIC_PROPS).
+    analytic = [p for p in active_props if p in ANALYTIC_PROPS]
+    for prop in analytic:
+        for i, s in enumerate(smiles_list):
+            if s is None or preds[i] is None:
+                continue
+            v = _vk_refractive(s) if prop == 'Refractive' else None
+            if v is None and prop in models:          # fall back to the ML model
+                f = _ex(_PROP_FEATURE.get(prop), s)
+                if f is not None:
+                    try:
+                        v = float(models[prop].predict(f.reshape(1, -1))[0])
+                    except Exception:
+                        v = None
+            preds[i][prop] = v if v is not None else 0.0
+
+    # which feature-keys do we actually need? (analytic props are already done)
+    keys_needed = {_PROP_FEATURE[p] for p in active_props
+                   if p in _PROP_FEATURE and p in models and p not in ANALYTIC_PROPS}
     # compute each feature matrix once (shared across properties using the same key)
     feat_rows = {}   # key -> (list_of_row_indices, matrix)
     for key in keys_needed:
@@ -763,7 +1076,7 @@ def compute_preds_batch(smiles_list, models, active_props):
         feat_rows[key] = (rows, np.vstack(mats) if mats else None)
 
     for prop in active_props:
-        if prop not in models or prop not in _PROP_FEATURE:
+        if prop not in models or prop not in _PROP_FEATURE or prop in ANALYTIC_PROPS:
             continue
         key = _PROP_FEATURE[prop]
         rows, X = feat_rows.get(key, ([], None))
@@ -836,6 +1149,63 @@ def evaluate_population_batch(individuals, models, targets, active_props, ranges
     return fits
 
 
+# --- Optional: keep the GA inside the models' applicability domain -------------------
+# OFF by default. The GA is meant to find NOVEL polymers, and this penalty pulls it back
+# towards the training set, so it trades novelty for prediction trustworthiness. Turned on
+# from the sidebar when the user wants candidates whose predictions can be believed.
+DOMAIN_PENALTY_ON = False
+DOMAIN_PENALTY_W = 3.0        # weight of the penalty in the single-objective fitness
+_DOMAIN_FPS = []              # reference fingerprints, filled by set_domain_reference()
+DOMAIN_CACHE = {}
+
+
+def set_domain_reference(smiles_list):
+    """Cache training-set fingerprints used by the applicability-domain penalty."""
+    global _DOMAIN_FPS
+    fps = []
+    for s in (smiles_list or [])[:4000]:
+        try:
+            m = Chem.MolFromSmiles(str(s).replace('*', '[H]'))
+            if m is not None:
+                fps.append(AllChem.GetMorganFingerprintAsBitVect(m, 3, 2048))
+        except Exception:
+            continue
+    _DOMAIN_FPS = fps
+    DOMAIN_CACHE.clear()
+
+
+def domain_distance(s_smiles):
+    """1 - max Tanimoto to the training set (0 = familiar, 1 = totally unlike anything seen)."""
+    if not _DOMAIN_FPS:
+        return 0.0
+    if s_smiles in DOMAIN_CACHE:
+        return DOMAIN_CACHE[s_smiles]
+    try:
+        m = Chem.MolFromSmiles(str(s_smiles).replace('*', '[H]'))
+        if m is None:
+            return 0.0
+        fp = AllChem.GetMorganFingerprintAsBitVect(m, 3, 2048)
+        d = 1.0 - max(DataStructs.BulkTanimotoSimilarity(fp, _DOMAIN_FPS))
+    except Exception:
+        d = 0.0
+    DOMAIN_CACHE[s_smiles] = d
+    return d
+
+
+def domain_penalty(s_smiles):
+    """
+    Extra cost for sitting outside the training distribution. Zero while the candidate is
+    still reasonably similar to known polymers (so ordinary novelty is NOT punished); it
+    only bites past the AD_WARN edge, where the models start extrapolating.
+    """
+    if not DOMAIN_PENALTY_ON:
+        return 0.0
+    sim = 1.0 - domain_distance(s_smiles)
+    if sim >= AD_WARN:
+        return 0.0
+    return DOMAIN_PENALTY_W * (AD_WARN - sim) / max(AD_WARN, 1e-6)
+
+
 def evaluate_individual_optimized(individual, models, targets, active_props, ranges):
     s_selfies = individual[0]
 
@@ -869,6 +1239,7 @@ def evaluate_individual_optimized(individual, models, targets, active_props, ran
 
     sa_score = get_sa_score_local(s_smiles)
     total_error += sa_score * 2.0
+    total_error += domain_penalty(s_smiles)     # no-op unless DOMAIN_PENALTY_ON
 
     result = (total_error,)
     FITNESS_CACHE[s_selfies] = result
@@ -910,7 +1281,9 @@ def evaluate_individual_multi(individual, models, targets, active_props, ranges)
     if worst_prop is not None:
         RESIDUAL_BIAS_CACHE[s_selfies] = {worst_prop: worst_dir}
 
-    objectives.append(get_sa_score_local(s_smiles) / 10.0)  # synthesizability objective
+    # Synthesizability objective; when the domain penalty is on, extrapolation is folded in
+    # here rather than added as a new objective (that would change the front's dimensionality).
+    objectives.append(get_sa_score_local(s_smiles) / 10.0 + domain_penalty(s_smiles) / 10.0)
     return tuple(objectives)
 
 
@@ -1236,8 +1609,15 @@ def cxSmart(ind1, ind2):
     return cxSelfies(ind1, ind2)
 
 
+def _ga_param_defaults():
+    """Default GA hyperparameters (overridable from the sidebar)."""
+    return {'pop_size': 100, 'tournsize': 7, 'cxpb': 0.8, 'fragpb': 0.6,
+            'mutpb': 0.1, 'chempb': 0.05, 'removepb': 0.15, 'newpb': 0.02}
+
+
 def run_single_objective_flow(models, generations, targets, active_props, initial_pop, ranges_dict,
-                              heuristic=True, preserve=True):
+                              heuristic=True, preserve=True, ga_params=None):
+    gp = dict(_ga_param_defaults(), **(ga_params or {}))
     toolbox = base.Toolbox()
     toolbox.register("attr_selfies", random.choice, initial_pop)
     toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_selfies, n=1)
@@ -1246,13 +1626,13 @@ def run_single_objective_flow(models, generations, targets, active_props, initia
     toolbox.register("evaluate", evaluate_individual_optimized, models=models, targets=targets, active_props=active_props, ranges=ranges_dict)
 
     toolbox.register("mate", cxSmart)
-    toolbox.register("select", tools.selTournament, tournsize=7)
+    toolbox.register("select", tools.selTournament, tournsize=int(gp['tournsize']))
 
     # Heuristic direction for each active target (low / high / mid) -> guides mutation.
     # Disabled (None) when the user turns heuristic guidance off for an A/B run.
     prop_bias = sga.goal_bias_from_targets(active_props, targets, ranges_dict) if heuristic else None
 
-    pop_size = 100
+    pop_size = int(gp['pop_size'])
     pop = toolbox.population(n=pop_size)
     
     history = {
@@ -1285,15 +1665,11 @@ def run_single_objective_flow(models, generations, targets, active_props, initia
 
     log_data = [] 
 
+    # GA probabilities come from the sidebar (ga_params) -- fixed across generations.
+    cxpb, mutpb, chempb, removepb, fragpb, newpb = (
+        gp['cxpb'], gp['mutpb'], gp['chempb'], gp['removepb'], gp['fragpb'], gp['newpb'])
+
     for gen in range(generations):
-        scale = gen / generations
-        cxpb = max(0.6, 0.8 - (0.2 * scale)) # 80den 60a düşen çaprazlama olasılığı
-        mutpb = max(0.02, 0.1 - (0.08 * scale)) # 10dan 2ye düşen SELFIES mutasyon olasılığı
-        chempb = max(0.01, 0.05 - (0.04 * scale)) # 5ten 1e düşen reaction mutasyon olasılığı
-        extendpb = max(0.01, 0.05 - (0.04 * scale)) # 5ten 1e düşen zincir uzatma olasılığı
-        newpb = 0.02 # Sabit kalan rastgele yeni birey ekleme olasılığı
-
-
         offspring = toolbox.select(pop, pop_size)
         offspring = list(map(toolbox.clone, offspring))
 
@@ -1308,8 +1684,8 @@ def run_single_objective_flow(models, generations, targets, active_props, initia
                  pass
             offspring[i] = generate_offspring(
                 offspring[i], initial_pop, prop_bias=prop_bias,
-                mutpb=mutpb, chempb=chempb, removepb=0.15,
-                fragpb=max(0.4, 0.7 - 0.3 * scale), newpb=newpb,
+                mutpb=mutpb, chempb=chempb, removepb=removepb,
+                fragpb=fragpb, newpb=newpb,
                 preserve=preserve, use_residual=heuristic,
             )
             del offspring[i].fitness.values
@@ -1367,13 +1743,27 @@ def run_single_objective_flow(models, generations, targets, active_props, initia
             log_placeholder.dataframe(df_log.sort_values(by=f"{_('gen')}", ascending=False).head(5), width='stretch')
             mutation_placeholder.json(mutation_stats)
 
-    best_ind = tools.selBest(pop, 5)[0]
-    best_smiles = selfies_to_smiles_safe(best_ind[0])
-    if best_smiles:
-        preds = compute_preds(best_smiles, models, list(models.keys())) or {}
-        return {'smiles': best_smiles, 'preds': preds, 'total_error': best_ind.fitness.values[0]}, history
-    else:
+    # Top-N DISTINCT candidates, not just the winner: the runner-up is often the one a chemist
+    # actually wants (easier to make, more familiar chemistry) and it costs nothing to surface.
+    n_want = max(1, int(TOP_N_CANDIDATES))       # always find the winner, even if the UI hides the list
+    ranked, seen_smi = [], set()
+    for ind in tools.selBest(pop, min(len(pop), n_want * 6)):
+        smi = selfies_to_smiles_safe(ind[0])
+        if not smi or smi in seen_smi:
+            continue
+        seen_smi.add(smi)
+        ranked.append((smi, float(ind.fitness.values[0])))
+        if len(ranked) >= n_want:
+            break
+    if not ranked:
         return None, history
+
+    best_smiles, best_err = ranked[0]
+    preds = compute_preds(best_smiles, models, list(models.keys())) or {}
+    top = [{'smiles': s, 'total_error': e,
+            'preds': (preds if s == best_smiles else (compute_preds(s, models, active_props) or {}))}
+           for s, e in ranked]
+    return {'smiles': best_smiles, 'preds': preds, 'total_error': best_err, 'top': top}, history
 
 
 def pick_knee_index(objective_rows):
@@ -1395,7 +1785,7 @@ def pick_knee_index(objective_rows):
 
 
 def run_nsga2_flow(models, generations, targets, active_props, initial_pop, ranges_dict,
-                   heuristic=True, preserve=True):
+                   heuristic=True, preserve=True, ga_params=None):
     """
     Multi-objective (NSGA-II) optimisation.
 
@@ -1426,7 +1816,8 @@ def run_nsga2_flow(models, generations, targets, active_props, initial_pop, rang
 
     prop_bias = sga.goal_bias_from_targets(active_props, targets, ranges_dict) if heuristic else None
 
-    pop_size = 100  # multiple of 4 (required by selTournamentDCD)
+    gp = dict(_ga_param_defaults(), **(ga_params or {}))
+    pop_size = max(8, (int(gp['pop_size']) // 4) * 4)   # selTournamentDCD needs a multiple of 4
     pop = toolbox.population(n=pop_size)
     for ind, fit in zip(pop, evaluate_population_batch(pop, models, targets, active_props, ranges_dict, multi=True)):
         ind.fitness.values = fit
@@ -1434,7 +1825,7 @@ def run_nsga2_flow(models, generations, targets, active_props, initial_pop, rang
 
     n_prop = len(active_props)
 
-    def prop_error(ind):
+    def _ind_prop_error(ind):   # NB: not the module-level prop_error(prop)
         """Sum of the property-error objectives (excludes the SA objective)."""
         return sum(ind.fitness.values[:n_prop])
 
@@ -1451,13 +1842,11 @@ def run_nsga2_flow(models, generations, targets, active_props, initial_pop, rang
         st.caption(f"{_('diversity_chart')}")
         chart_diversity_placeholder = st.empty()
 
-    for gen in range(generations):
-        scale = gen / generations
-        cxpb = max(0.6, 0.8 - 0.2 * scale)
-        mutpb = max(0.02, 0.1 - 0.08 * scale)
-        chempb = max(0.01, 0.05 - 0.04 * scale)
-        newpb = 0.02
+    # GA probabilities from the sidebar (ga_params) -- fixed across generations.
+    cxpb, mutpb, chempb, removepb, fragpb, newpb = (
+        gp['cxpb'], gp['mutpb'], gp['chempb'], gp['removepb'], gp['fragpb'], gp['newpb'])
 
+    for gen in range(generations):
         # NSGA-II parent selection by dominance + crowding distance.
         offspring = tools.selTournamentDCD(pop, pop_size)
         offspring = [toolbox.clone(ind) for ind in offspring]
@@ -1470,8 +1859,8 @@ def run_nsga2_flow(models, generations, targets, active_props, initial_pop, rang
         for i in range(len(offspring)):
             offspring[i] = generate_offspring(
                 offspring[i], initial_pop, prop_bias=prop_bias,
-                mutpb=mutpb, chempb=chempb, removepb=0.15,
-                fragpb=max(0.4, 0.7 - 0.3 * scale), newpb=newpb,
+                mutpb=mutpb, chempb=chempb, removepb=removepb,
+                fragpb=fragpb, newpb=newpb,
                 preserve=preserve, use_residual=heuristic,
             )
             del offspring[i].fitness.values
@@ -1483,7 +1872,7 @@ def run_nsga2_flow(models, generations, targets, active_props, initial_pop, rang
         # mu+lambda environmental selection -> next generation.
         pop = toolbox.select(pop + offspring, pop_size)
 
-        errs = [prop_error(ind) for ind in pop]
+        errs = [_ind_prop_error(ind) for ind in pop]
         valid = [e for e in errs if e < 999.0]
         if valid:
             best_val, mean_val, std_val = min(valid), sum(valid) / len(valid), float(np.std(valid))
@@ -1521,7 +1910,7 @@ def run_nsga2_flow(models, generations, targets, active_props, initial_pop, rang
             "smiles": smi,
             "preds": PRED_CACHE.get(ind[0], {}),
             "obj": list(ind.fitness.values),
-            "prop_error": prop_error(ind),
+            "prop_error": _ind_prop_error(ind),
         })
     pareto.sort(key=lambda d: d["prop_error"])
     for sol in pareto:
@@ -1541,9 +1930,13 @@ def run_nsga2_flow(models, generations, targets, active_props, initial_pop, rang
     # Headline "best" = the balanced knee-point solution.
     chosen = pareto[knee_idx] if knee_idx is not None else pareto[0]
     preds = compute_preds(chosen["smiles"], models, list(models.keys())) or {}
+    # Top-N from the front, best-first by total property error (the knee stays the headline).
+    top = [{'smiles': s["smiles"], 'total_error': s["prop_error"], 'preds': s.get("preds", {}),
+            'tag': s.get("tag", "")}
+           for s in sorted(pareto, key=lambda d: d["prop_error"])[:max(1, int(TOP_N_CANDIDATES))]]
     best_poly_data = {
         'smiles': chosen["smiles"], 'preds': preds,
-        'total_error': chosen["prop_error"], 'is_knee': True,
+        'total_error': chosen["prop_error"], 'is_knee': True, 'top': top,
     }
     return best_poly_data, history, pareto
 
@@ -1603,6 +1996,33 @@ def check_commercial_availability(query):
             return False, None, None
     except:
         return False, None, None
+
+
+PUBCHEM_COMPOUND_URL = "https://pubchem.ncbi.nlm.nih.gov/compound/{cid}"
+PUBCHEM_SEARCH_URL = "https://pubchem.ncbi.nlm.nih.gov/#query={q}"
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def lookup_monomer(smi: str):
+    """
+    Look a monomer up on PubChem -> (found, cid, name, url).
+    `url` is ALWAYS usable: the compound page when the molecule is registered, otherwise a
+    PubChem structure-search link for the SMILES so the user can keep digging. Cached for a
+    day so the retro tab can check every monomer at once without hammering the API.
+    """
+    smi = (smi or "").strip()
+    if not smi:
+        return False, None, None, None
+    try:
+        found, cid, name = check_commercial_availability(smi)
+    except Exception:
+        found, cid, name = False, None, None
+    if found and cid:
+        return True, cid, name, PUBCHEM_COMPOUND_URL.format(cid=cid)
+    from urllib.parse import quote
+    return False, None, None, PUBCHEM_SEARCH_URL.format(q=quote(smi))
+
+
 def make_3d_view_with_reason(smiles):
     try:
         clean_smi = str(smiles).replace('*', '[H]')
@@ -2148,20 +2568,27 @@ if models and SHOW_MANUAL_ANALYSIS:
                                           placeholder="*CC(c1ccccc1)*")
         with mcol_btn:
             st.write(""); st.write("")
-            run_manual = st.button(f"{_('manual_btn')}", use_container_width=True, key="manual_run_btn")
+            run_manual = st.button(f"{_('manual_btn')}", width='stretch', key="manual_run_btn")
 
+        # Persist the analyzed SMILES so the panel survives the rerun the xtb button triggers
+        # (Streamlit re-executes the whole script on every click, clearing `run_manual`).
         if run_manual and manual_smiles:
-            _mmol = Chem.MolFromSmiles(str(manual_smiles).replace('*', '[H]'))
+            st.session_state['manual_analyzed'] = str(manual_smiles)
+            st.session_state.pop('manual_xtb', None)   # invalidate any previous xtb result
+
+        _asmi = st.session_state.get('manual_analyzed')
+        if _asmi:
+            _mmol = Chem.MolFromSmiles(str(_asmi).replace('*', '[H]'))
             if _mmol is None:
                 st.error(f"❌ {_('manual_invalid')}")
             else:
-                m_preds = compute_preds(manual_smiles, models, ALL_PROPS) or {}
+                m_preds = compute_preds(_asmi, models, ALL_PROPS) or {}
                 mc_struct, mc_props = st.columns([1, 2])
                 with mc_struct:
-                    _img = draw_2d_molecule(manual_smiles)
+                    _img = draw_2d_molecule(_asmi)
                     if _img is not None:
-                        st.image(_img, use_container_width=True)
-                    st.metric(f"{_('metric_sa_score')}", f"{get_sa_score_local(manual_smiles):.2f} / 10")
+                        st.image(_img, width='stretch')
+                    st.metric(f"{_('metric_sa_score')}", f"{get_sa_score_local(_asmi):.2f} / 10")
                 with mc_props:
                     if SHOW_RELIABILITY:
                         st.caption(f"{_('reliability_legend')}")
@@ -2171,26 +2598,87 @@ if models and SHOW_MANUAL_ANALYSIS:
                         if SHOW_RELIABILITY:
                             _tier = MODEL_RELIABILITY.get(_p, 'medium')
                             _badge = f'<span title="{_(f"reliability_{_tier}")}">{RELIABILITY_BADGE.get(_tier, "")}</span>'
+                        _u = prop_unit(_p)
+                        _u_html = f' <span style="font-size:0.6em; opacity:0.6;">{_u}</span>' if _u else ''
                         with _pcols[_i % 3]:
                             st.markdown(f"""
                             <div class="metric-card" style="border-left: 5px solid #9b59b6;">
                                 <small>{_p} {_badge}</small><br>
-                                <h3 style="margin:0; padding:0;">{m_preds.get(_p, 0.0):.2f}</h3>
+                                <h3 style="margin:0; padding:0;">{m_preds.get(_p, 0.0):.2f}{_u_html}</h3>
                             </div>""", unsafe_allow_html=True)
                 st.divider()
                 st.markdown(f"**{_('retro_analysis_header')}**")
-                _routes = retro.retro_decompose(manual_smiles)
+                _routes = retro.retro_decompose(_asmi)
                 if _routes:
                     _r = _routes[0]
                     _vf = "🔬" if _r.get('verified', False) else "⚠️"
-                    st.info(f"{_vf} **{_('yontem')}:** {_r['type']}  |  {_r['mechanism']}")
+                    _rex = {True: f" · ✅ {_('retro_exact')}", False: f" · ≈ {_('retro_approx')}"}.get(_r.get('exact'), "")
+                    st.info(f"{_vf} **{_('yontem')}:** {tr_retro(_r['type'])}  |  {tr_retro(_r['mechanism'])}{_rex}")
                     _img_r = draw_retrosynthesis_grid(_r['monomers'])
                     if _img_r is not None:
                         st.image(_img_r)
                     for _i, _m in enumerate(_r['monomers']):
                         st.code(f"Monomer {_i+1}: {_m}")
+                        _ok, _cid, _nm, _url = lookup_monomer(_m)
+                        if _ok:
+                            st.markdown(f"&nbsp;&nbsp;✅ [{_nm or ('CID ' + str(_cid))}]({_url}) "
+                                        f"<span style='opacity:.6;font-size:.85em'>CID {_cid}</span>",
+                                        unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"&nbsp;&nbsp;❔ {_('kayitli_degil')} — [{_('pubchem_search')}]({_url})")
                 else:
                     st.warning(f"{_('retro_auto_failed')}")
+
+                # --- Optional GFN2-xTB quantum cross-check (local only; auto-hides on cloud) ---
+                if ENABLE_XTB and str(_asmi).count('*') >= 2:
+                    try:
+                        import xtb_tools as _xtbt
+                        _xexe = _xtbt.find_xtb()
+                    except Exception:
+                        _xtbt, _xexe = None, None
+                    # branched (>2 '*') units are linearised along the main chain for xtb
+                    _mx_smi = str(_asmi)
+                    if _mx_smi.count('*') > 2:
+                        try:
+                            _mx_smi = retro._linearize_multistar(_mx_smi)
+                        except Exception:
+                            _mx_smi = None
+                    if _xtbt and _xexe and _mx_smi:
+                        st.divider()
+                        st.markdown(f"**🔬 {_('xtb_header')}**")
+                        st.caption(_('xtb_desc'))
+                        if str(_asmi).count('*') > 2:
+                            st.caption(f"ℹ️ {_('verify_branched')}")
+                        if st.button(f"🔬 {_('xtb_btn')}", key="manual_xtb_btn"):
+                            with st.spinner(_('xtb_running')):
+                                st.session_state['manual_xtb'] = _xtbt.crosscheck_one(_mx_smi, _xexe)
+                        _xr = st.session_state.get('manual_xtb')
+                        if _xr:
+                            if _xr.get('gap_inf') is None and _xr.get('alpha_vol') is None:
+                                st.warning(f"⚠️ {_('xtb_failed')}: {_xr.get('error', '')}")
+                            else:
+                                _xc1, _xc2 = st.columns(2)
+                                with _xc1:
+                                    _mg = m_preds.get('BandgapChain')
+                                    _xg = _xr.get('gap_inf')
+                                    _mg_s = f"{_mg:.2f}" if _mg is not None else "–"
+                                    _xg_s = f"{_xg:.2f}" if _xg is not None else "–"
+                                    st.markdown(f"""
+                                    <div class="metric-card" style="border-left:5px solid #16a085;">
+                                        <small>{_('xtb_gap_label')}</small><br>
+                                        <h3 style="margin:0; padding:0;">{_xg_s} <span style="font-size:0.6em; opacity:0.6;">eV</span></h3>
+                                        <small style="opacity:0.7;">{_('xtb_model_label')}: {_mg_s} eV</small>
+                                    </div>""", unsafe_allow_html=True)
+                                with _xc2:
+                                    _av = _xr.get('alpha_vol')
+                                    _av_s = f"{_av:.3f}" if _av is not None else "–"
+                                    st.markdown(f"""
+                                    <div class="metric-card" style="border-left:5px solid #16a085;">
+                                        <small>{_('xtb_polar_label')}</small><br>
+                                        <h3 style="margin:0; padding:0;">{_av_s}</h3>
+                                        <small style="opacity:0.7;">{_('xtb_polar_hint')}</small>
+                                    </div>""", unsafe_allow_html=True)
+                                st.caption(_('xtb_note'))
 
 # --- MANUEL POLİMER TAHMİN BÖLÜMÜ BAŞLANGICI ---
 # st.divider()
@@ -2203,7 +2691,7 @@ if models and SHOW_MANUAL_ANALYSIS:
 #     with col_btn:
 #         st.write("") # Düğmeyi hizalamak için boşluk
 #         st.write("")
-#         run_manual = st.button("Tahmin Et", type="primary", use_container_width=True)
+#         run_manual = st.button("Tahmin Et", type="primary", width='stretch')
 
 #     if run_manual and manual_smiles:
 #         # Molekülün geçerliliğini kontrol et
@@ -2244,7 +2732,7 @@ if models and SHOW_MANUAL_ANALYSIS:
 #                     st.markdown("#### 2D Molekül Yapısı")
 #                     img = draw_2d_molecule(manual_smiles)
 #                     if img:
-#                         st.image(img, use_container_width=True)
+#                         st.image(img, width='stretch')
                     
 #                     # Sentez Zorluğu ve Yeşil Skor
 #                     sa_score = get_sa_score_local(manual_smiles)
@@ -2413,8 +2901,52 @@ if models:
                                         help=f'{_("use_heuristic_help")}')
     preserve_structure = st.sidebar.checkbox(f'{_("preserve_structure")}', value=True,
                                              help=f'{_("preserve_structure_help")}')
+    # OFF by default: it trades novelty for trustworthy predictions (see domain_penalty()).
+    stay_in_domain = st.sidebar.checkbox(f'{_("stay_in_domain")}', value=False,
+                                         help=f'{_("stay_in_domain_help")}')
+    if stay_in_domain:
+        st.sidebar.caption(f"⚖️ {_('stay_in_domain_note')}")
     seed_val = st.sidebar.number_input(f'{_("random_seed")}', min_value=0, max_value=999999,
                                        value=0, step=1, help=f'{_("random_seed_help")}')
+
+    # Start the search FROM a polymer of the user's own instead of from the dataset.
+    start_smiles = st.sidebar.text_input(f'{_("start_from")}', value="",
+                                         placeholder="*CC(c1ccccc1)*",
+                                         help=f'{_("start_from_help")}')
+    start_selfies = None
+    if start_smiles.strip():
+        _s_ok = sga.is_valid_polymer_smiles(start_smiles.strip())
+        if _s_ok:
+            start_selfies = smiles_to_selfies_safe(start_smiles.strip())
+        if not _s_ok or not start_selfies:
+            st.sidebar.warning(f'⚠️ {_("start_from_invalid")}')
+            start_selfies = None
+        else:
+            st.sidebar.success(f'✅ {_("start_from_ok")}')
+
+    # Advanced GA hyperparameters (mutation/crossover probabilities, population, etc.)
+    with st.sidebar.expander(f"⚙️ {_('ga_params_title')}", expanded=False):
+        _d = _ga_param_defaults()
+        ga_params = {
+            'pop_size': st.slider(f"{_('ga_pop_size')}", 20, 400, _d['pop_size'], step=4,
+                                  help=f"{_('ga_pop_size_help')}"),
+            'cxpb': st.slider(f"{_('ga_cxpb')}", 0.0, 1.0, _d['cxpb'], step=0.05,
+                              help=f"{_('ga_cxpb_help')}"),
+            'fragpb': st.slider(f"{_('ga_fragpb')}", 0.0, 1.0, _d['fragpb'], step=0.05,
+                                help=f"{_('ga_fragpb_help')}"),
+            'mutpb': st.slider(f"{_('ga_mutpb')}", 0.0, 0.5, _d['mutpb'], step=0.01,
+                               help=f"{_('ga_mutpb_help')}"),
+            'chempb': st.slider(f"{_('ga_chempb')}", 0.0, 0.3, _d['chempb'], step=0.01,
+                                help=f"{_('ga_chempb_help')}"),
+            'removepb': st.slider(f"{_('ga_removepb')}", 0.0, 0.5, _d['removepb'], step=0.01,
+                                  help=f"{_('ga_removepb_help')}"),
+            'newpb': st.slider(f"{_('ga_newpb')}", 0.0, 0.3, _d['newpb'], step=0.01,
+                               help=f"{_('ga_newpb_help')}"),
+            'tournsize': st.slider(f"{_('ga_tournsize')}", 2, 15, _d['tournsize'], step=1,
+                                   help=f"{_('ga_tournsize_help')}"),
+        }
+        if st.button(f"{_('ga_reset')}", key="ga_reset_btn"):
+            ga_params = _ga_param_defaults()
 
     initial_selfies, reference_smiles = get_initial_population()
     st.sidebar.divider()
@@ -2435,6 +2967,14 @@ if models:
         if seed_val:
             random.seed(int(seed_val))
             np.random.seed(int(seed_val))
+        st.session_state['ga_seed_used'] = int(seed_val) if seed_val else None
+
+        # Applicability-domain penalty: opt-in, so novelty is untouched by default.
+        DOMAIN_PENALTY_ON = bool(stay_in_domain)
+        globals()['DOMAIN_PENALTY_ON'] = DOMAIN_PENALTY_ON
+        st.session_state['ga_domain_penalty'] = DOMAIN_PENALTY_ON
+        if DOMAIN_PENALTY_ON:
+            set_domain_reference(reference_smiles)
 
         with st.spinner(f'{_("msg_optimizing")} {", ".join(active_props)}'):
             if use_heuristic:
@@ -2445,16 +2985,25 @@ if models:
                 # Blind start: plain dataset population, no goal-directed seeding.
                 seeded_pop = initial_selfies
 
+            # "Optimize from MY polymer": make the user's structure the dominant starting
+            # point (~half the population) so the search improves it rather than ignoring it.
+            if start_selfies:
+                _n_seed = max(1, len(seeded_pop) // 2)
+                seeded_pop = [start_selfies] * _n_seed + list(seeded_pop)
+                st.session_state['ga_started_from'] = start_smiles.strip()
+            else:
+                st.session_state.pop('ga_started_from', None)
+
             pareto = None
             if opt_mode == "nsga2":
                 best_poly_data, history, pareto = run_nsga2_flow(
                     models, generations, targets, active_props, seeded_pop, ranges,
-                    heuristic=use_heuristic, preserve=preserve_structure,
+                    heuristic=use_heuristic, preserve=preserve_structure, ga_params=ga_params,
                 )
             else:
                 best_poly_data, history = run_single_objective_flow(
                     models, generations, targets, active_props, seeded_pop, ranges,
-                    heuristic=use_heuristic, preserve=preserve_structure,
+                    heuristic=use_heuristic, preserve=preserve_structure, ga_params=ga_params,
                 )
 
         if best_poly_data:
@@ -2463,6 +3012,9 @@ if models:
             st.session_state['ga_targets'] = targets
             st.session_state['ga_active_props'] = active_props
             st.session_state['ga_pareto'] = pareto
+            # per-result caches belong to the OLD polymer -> drop them
+            st.session_state.pop('ad_sim', None)
+            st.session_state.pop('verify_xtb', None)
             
     
     if 'ga_results' in st.session_state:
@@ -2473,10 +3025,39 @@ if models:
         saved_active_props = st.session_state['ga_active_props']
         
         preds = best_poly_data['preds']
-        
+
         st.success(f"{_('msg_success')}")
-        
-        tab1, tab2, tab3, tab4, tab6 = st.tabs([f"{_('tab_general')}", f"{_('tab_structural')}", f"{_('tab_evolution')}", f"{_('tab_report')}", f"{_('tab_retro')}"])
+
+        # If the run started from the user's own polymer, show what the GA improved.
+        _from_smi = st.session_state.get('ga_started_from')
+        if _from_smi:
+            with st.expander(f"🔁 {_('start_from_compare')}", expanded=False):
+                _from_preds = compute_preds(_from_smi, models, saved_active_props) or {}
+                st.caption(f"`{_from_smi}`  →  `{best_poly_data['smiles']}`")
+                _rows = []
+                for _p in saved_active_props:
+                    _b, _a = _from_preds.get(_p), preds.get(_p)
+                    _t = saved_targets.get(_p)
+                    if _b is None or _a is None:
+                        continue
+                    _closer = (abs(_a - _t) < abs(_b - _t)) if _t is not None else None
+                    _rows.append({
+                        _('start_from_prop'): f"{_p}{f' ({prop_unit(_p)})' if prop_unit(_p) else ''}",
+                        _('start_from_before'): round(_b, 2),
+                        _('start_from_after'): round(_a, 2),
+                        _('target'): (f"{_t:.2f}" if _t is not None else "—"),   # str, not mixed
+                        "": "✅" if _closer else ("→" if _closer is None else "⚠️"),
+                    })
+                if _rows:
+                    st.dataframe(pd.DataFrame(_rows), hide_index=True, width='stretch')
+
+        _tab_labels = [f"{_('tab_general')}", f"{_('tab_structural')}", f"{_('tab_evolution')}",
+                       f"{_('tab_report')}", f"{_('tab_retro')}"]
+        if SHOW_BLENDS:
+            _tab_labels.append(f"🧪 {_('tab_blend')}")
+        _tabs = st.tabs(_tab_labels)
+        tab1, tab2, tab3, tab4, tab6 = _tabs[0], _tabs[1], _tabs[2], _tabs[3], _tabs[4]
+        tab_blend = _tabs[5] if SHOW_BLENDS else None
         with tab1:
             col_main, col_score, col_green = st.columns([2, 1, 1])
             
@@ -2529,6 +3110,25 @@ if models:
                         st.write("-")
                 
                 st.caption(f"*{_('solubility_explanation_1')}(δ={sol_val:.1f}) {_('solubility_explanation_2')}")
+            # --- Applicability domain: how far is this polymer from the training data? ---
+            # Computed from the same Tanimoto novelty score shown in the Structure tab.
+            _ad_sim = st.session_state.get('ad_sim')
+            if _ad_sim is None:
+                try:
+                    # NB: never unpack into `_` here -- it is the translation function.
+                    _ad_sim, _ad_nearest = calculate_novelty_optimized(best_poly_data['smiles'], reference_smiles)
+                    st.session_state['ad_sim'] = _ad_sim
+                except Exception:
+                    _ad_sim = None
+            _ad_state, _ad_icon = applicability(_ad_sim)
+            if SHOW_APPLICABILITY:
+                if _ad_state != 'in':
+                    _ad_msg = _('ad_warn_edge') if _ad_state == 'edge' else _('ad_warn_out')
+                    st.warning(f"{_ad_icon} **{_('ad_title')}** — {_ad_msg}"
+                               + (f"  \n*{_('ad_similarity')}: {_ad_sim:.2f}*" if _ad_sim is not None else ""))
+                elif _ad_sim is not None:
+                    st.caption(f"{_ad_icon} {_('ad_title')}: {_('ad_ok')} ({_('ad_similarity')}: {_ad_sim:.2f})")
+
             if SHOW_RELIABILITY:
                 st.caption(f"{_('reliability_legend')}")
             cols = st.columns(3)
@@ -2545,13 +3145,94 @@ if models:
                         tier = MODEL_RELIABILITY.get(prop, 'medium')
                         badge_html = f'<span title="{_(f"reliability_{tier}")}">{RELIABILITY_BADGE.get(tier, "")}</span>'
 
+                    _unit = prop_unit(prop)
+                    _unit_html = f' <span style="font-size:0.6em; opacity:0.6;">{_unit}</span>' if _unit else ''
+                    # measured typical error (part of the reliability display -> same flag).
+                    # Molecule-specific where the uncertainty signal was validated, else global.
+                    _err_html = ""
+                    if SHOW_RELIABILITY:
+                        _mae, _src = prop_error_for(prop, best_poly_data['smiles'])
+                        if _mae is not None:
+                            _tip = {'mol': _('mae_molecule'), 'gold': _('mae_gold'),
+                                    'held': _('mae_heldout')}.get(_src, _('mae_insample'))
+                            _star = '＊' if _src == 'mol' else ''
+                            _sym = '×/÷' if prop in FOLD_PROPS else '±'
+                            _err_html = (f' <span style="font-size:0.5em; opacity:0.65;" '
+                                         f'title="{_tip}">{_sym} {_mae:.3g}{_star}</span>')
                     st.markdown(f"""
                     <div class="metric-card" style="border-left: 5px solid {border_color};">
                         <small>{prop} {badge_html}</small><br>
-                        <h3 style="margin:0; padding:0;">{pred_value:.2f}</h3>
+                        <h3 style="margin:0; padding:0;">{pred_value:.2f}{_unit_html}{_err_html}</h3>
                         <small style="opacity:0.7">{target_text}</small>
                     </div>
                     """, unsafe_allow_html=True)
+            if SHOW_RELIABILITY and any(prop_error(p)[0] is not None for p in ALL_PROPS):
+                st.caption(f"{_('mae_legend')}")
+            # --- Chemist's review ------------------------------------------------------
+            # Flags numbers that are physically meaningless for THIS polymer (a melting point
+            # on an amorphous structure) and motifs that would not survive as a repeat unit.
+            if SHOW_CHEM_REVIEW:
+                try:
+                    import chem_review as _cr
+                    _notes = _cr.review(best_poly_data['smiles'], preds)
+                except Exception:
+                    _notes = []
+                if _notes:
+                    _ne, _nw, _ni = _cr.summary(_notes)
+                    _hdr = f"🧑‍🔬 {_('chem_review_title')}"
+                    if _ne:
+                        _hdr += f" — ❌ {_ne}"
+                    if _nw:
+                        _hdr += f" — ⚠️ {_nw}"
+                    with st.expander(_hdr, expanded=bool(_ne)):
+                        st.caption(_('chem_review_desc'))
+                        for _nt in _notes:
+                            _ic = {"error": "❌", "warn": "⚠️", "info": "ℹ️"}[_nt["level"]]
+                            # chem_review.py is UI-agnostic: translate via its key when present
+                            _msg = (_(_nt["key"]).format(**(_nt.get("args") or {}))
+                                    if _nt.get("key") else _nt["message"])
+                            _txt = f"{_ic} **{_nt['topic']}** — {_msg}"
+                            (st.error if _nt["level"] == "error" else
+                             st.warning if _nt["level"] == "warn" else st.info)(_txt)
+
+            # --- Runner-up candidates -------------------------------------------------
+            # The lowest-error polymer is not always the one to make: a close runner-up may be
+            # far easier to synthesise or built from familiar chemistry. Show the shortlist.
+            _top = best_poly_data.get('top') or []
+            if TOP_N_CANDIDATES and len(_top) > 1:
+                st.divider()
+                with st.expander(f"🥈 {_('topn_title')} ({len(_top)})", expanded=False):
+                    st.caption(_('topn_desc'))
+                    _rows = []
+                    for _i, _c in enumerate(_top, 1):
+                        _cs = _c['smiles']
+                        _cp = _c.get('preds') or {}
+                        _row = {"#": _i, "SMILES": _cs,
+                                _('metric_total_error'): round(_c.get('total_error', float('nan')), 4),
+                                _('metric_sa_score'): round(get_sa_score_local(_cs), 2)}
+                        for _p in saved_active_props:
+                            if _cp.get(_p) is not None:
+                                _u = prop_unit(_p)
+                                _row[f"{_p}{f' ({_u})' if _u else ''}"] = round(_cp[_p], 2)
+                        # always present: a column that exists on only SOME rows becomes
+                        # str+NaN, which Arrow cannot serialise
+                        _row["★"] = ("⭐" if "knee" in _c.get('tag', '')
+                                     else "🎯" if "min-error" in _c.get('tag', '') else "")
+                        _rows.append(_row)
+                    st.dataframe(pd.DataFrame(_rows), hide_index=True, width='stretch')
+                    _imgs = [draw_2d_molecule(_c['smiles']) for _c in _top[:6]]
+                    _imgs = [(i, im) for i, im in enumerate(_imgs, 1) if im is not None]
+                    if _imgs:
+                        _icols = st.columns(min(3, len(_imgs)))
+                        for _k, (_n, _im) in enumerate(_imgs):
+                            with _icols[_k % len(_icols)]:
+                                st.image(_im, caption=f"#{_n}", width='stretch')
+                    st.download_button(
+                        f"⬇️ {_('topn_download')}",
+                        data=pd.DataFrame(_rows).to_csv(index=False).encode('utf-8'),
+                        file_name="polsen_top_candidates.csv", mime="text/csv",
+                        key="topn_csv")
+
             st.divider()
             st.subheader(f"{_('radar_title')}")
             if len(saved_active_props) >= 3:
@@ -2559,7 +3240,80 @@ if models:
                     st.plotly_chart(fig, width='stretch')
             else:
                     st.info(f"{_('radar_warning')}")
-                    st.progress(100) 
+                    st.progress(100)
+
+            # --- Independent per-polymer verification of THIS result ---
+            # van Krevelen group-contribution (Solubility/Hansen/Refractive) always runs; the
+            # GFN2-xTB checks (band gap, dielectric floor) are added only where xtb is installed.
+            _ver_smi = str(best_poly_data['smiles'])
+            if ENABLE_XTB and _ver_smi.count('*') >= 2:
+                try:
+                    import van_krevelen as _vk
+                except Exception:
+                    _vk = None
+                try:
+                    import xtb_tools as _xtbt
+                    _vexe = _xtbt.find_xtb()
+                except Exception:
+                    _xtbt, _vexe = None, None
+                # xtb builds oligomers, so it needs a LINEAR two-'*' chain. A branched
+                # (>2 '*') unit is linearised along its main chain first; van Krevelen needs
+                # no such thing -- it tiles every atom, branch points included.
+                _xtb_smi = _ver_smi
+                if _ver_smi.count('*') > 2:
+                    try:
+                        _xtb_smi = retro._linearize_multistar(_ver_smi)
+                    except Exception:
+                        _xtb_smi = None
+                if _vk or (_xtbt and _vexe):
+                    st.divider()
+                    st.subheader(f"🔬 {_('verify_title')}")
+                    st.caption(_('verify_desc'))
+                    if _ver_smi.count('*') > 2:
+                        st.caption(f"ℹ️ {_('verify_branched')}")
+                    if st.button(f"🔬 {_('verify_btn')}", key="verify_xtb_btn"):
+                        _checks = []
+                        if _xtbt and _vexe and _xtb_smi:
+                            with st.spinner(_('xtb_running')):
+                                _vres = _xtbt.verify_predictions(_xtb_smi, preds, _vexe)
+                            _checks += _vres.get('checks') or []
+                        if _vk:
+                            try:
+                                # skip properties van Krevelen itself now predicts: comparing a
+                                # value against its own source would trivially always agree
+                                _checks += [c for c in _vk.vk_verify(_ver_smi, preds)
+                                            if c.get('prop') not in ANALYTIC_PROPS]
+                            except Exception:
+                                pass
+                        st.session_state['verify_xtb'] = {'smiles': _ver_smi, 'checks': _checks}
+                    _vx = st.session_state.get('verify_xtb')
+                    if _vx and _vx.get('smiles') == best_poly_data['smiles']:
+                        _checks = _vx.get('checks') or []
+                        if not _checks:
+                            st.info(_('verify_none'))
+                        else:
+                            _vicon = {'ok': '✅', 'warn': '⚠️', 'bad': '❌'}
+                            _vcols = st.columns(len(_checks))
+                            for _ci, _chk in enumerate(_checks):
+                                with _vcols[_ci]:
+                                    _mv = _chk['model']; _ev = _chk['estimate']; _un = _chk['unit']
+                                    _ic = _vicon.get(_chk['status'], '')
+                                    _meth = _chk.get('method', '')
+                                    if _chk['kind'] == 'lower_bound':
+                                        _cmp = f"≥ {_ev:.2f} {_un}".strip()
+                                        _sub = _('verify_floor')
+                                    else:
+                                        _band = f" ± {_chk['unc']:.2f}" if _chk.get('unc') else ""
+                                        _cmp = f"{_ev:.2f}{_band} {_un}".strip()
+                                        _sub = _('verify_independent')
+                                    st.markdown(f"""
+                                    <div class="metric-card" style="border-left:5px solid #16a085;">
+                                        <small>{_chk['prop']} {_ic}</small><br>
+                                        <h3 style="margin:0; padding:0;">{_mv:.2f} <span style="font-size:0.5em; opacity:0.6;">{_un}</span></h3>
+                                        <small style="opacity:0.7;">{_sub}: {_cmp}</small><br>
+                                        <small style="opacity:0.5; font-size:0.7em;">{_meth}</small>
+                                    </div>""", unsafe_allow_html=True)
+                            st.caption(_('verify_note'))
         with tab2:
             col_2d, col_3d = st.columns(2)
             with col_2d:
@@ -2585,7 +3339,7 @@ if models:
             
             is_avail, cid, name = check_pubchem_availability(best_poly_data['smiles'])
             if is_avail:
-                 st.info(f"{_('kayitli')} **{name}** (CID: {cid})")
+                 st.info(f"{_('kayitli')} **[{name}]({PUBCHEM_COMPOUND_URL.format(cid=cid)})** (CID: {cid})")
             st.divider()
             st.subheader(f"{_('novelty_search')}")
             
@@ -2658,7 +3412,8 @@ if models:
                     mark = "⭐" if "knee" in sol.get("tag", "") else ("🎯" if "min-error" in sol.get("tag", "") else "")
                     row = {_("col_pick"): mark, "#": i + 1, "SMILES": sol["smiles"]}
                     for prop in saved_active_props:
-                        row[prop] = round(sol["preds"].get(prop, float('nan')), 2)
+                        _col = f"{prop} ({prop_unit(prop)})" if prop_unit(prop) else prop
+                        row[_col] = round(sol["preds"].get(prop, float('nan')), 2)
                     row["SA"] = round(sol["obj"][-1] * 10, 2)
                     rows.append(row)
                 df_pareto = pd.DataFrame(rows)
@@ -2805,27 +3560,287 @@ if models:
             #         with st.expander("📄 Tüm Test Verilerini Gör"):
             #             st.dataframe(df_results)
 
+        # --- Blend / alloy tab ------------------------------------------------------------
+        # Neat homopolymers are rarely the end product: Noryl is PS/PPO, ABS and HIPS are
+        # toughened blends. Blend this result with a commodity polymer or another candidate.
+        if SHOW_BLENDS and tab_blend is not None:
+            with tab_blend:
+                st.header(f"🧪 {_('blend_header')}")
+                st.caption(_('blend_desc'))
+                try:
+                    import blends as _bl
+                except Exception:
+                    _bl = None
+                if _bl is None:
+                    st.warning("blends module unavailable")
+                else:
+                    _partners = dict(sga.BASE_POLYMERS) if hasattr(sga, "BASE_POLYMERS") else {}
+                    for _t in (best_poly_data.get('top') or [])[1:4]:
+                        _partners[f"{_('blend_candidate')} {_t['smiles'][:26]}"] = _t['smiles']
+                    _bc1, _bc2 = st.columns([2, 1])
+                    with _bc1:
+                        _pname = st.selectbox(f"{_('blend_partner')}", list(_partners),
+                                              key="blend_partner")
+                        _custom = st.text_input(f"{_('blend_custom')}", value="",
+                                                placeholder="*CC(c1ccccc1)*", key="blend_custom")
+                    with _bc2:
+                        _wfrac = st.slider(f"{_('blend_weight')}", 5, 95, 50, step=5,
+                                           key="blend_w") / 100.0
+                    _mode = st.radio(f"{_('blend_mode')}",
+                                     ["blend", "random", "alternating", "block"],
+                                     horizontal=True, key="blend_mode",
+                                     format_func=lambda k: _(f"blend_mode_{k}"))
+                    _partner_smi = _custom.strip() or _partners.get(_pname)
+                    if _partner_smi and sga.is_valid_polymer_smiles(_partner_smi) and _mode != "blend":
+                        # ---- COPOLYMER: covalently bonded, so no miscibility question ----
+                        try:
+                            import copolymers as _cop
+                        except Exception:
+                            _cop = None
+                        if _cop is None:
+                            st.warning("copolymers module unavailable")
+                        else:
+                            _pa2 = preds
+                            _pb2 = compute_preds(_partner_smi, models, ALL_PROPS) or {}
+                            _cres = _cop.copolymer(
+                                best_poly_data['smiles'], _partner_smi, _wfrac, _mode,
+                                preds_a=_pa2, preds_b=_pb2, basis="weight",
+                                predict_fn=lambda u: compute_preds(u, models, ALL_PROPS))
+                            if _cres:
+                                st.subheader(f"🔗 {_(f'blend_mode_{_mode}')}  "
+                                             f"({_wfrac:.0%} / {1-_wfrac:.0%} w/w)")
+                                if _cres.get("unit"):
+                                    st.caption(_('copo_built_unit'))
+                                    st.code(_cres["unit"], language="text")
+                                    _uimg = draw_2d_molecule(_cres["unit"])
+                                    if _uimg is not None:
+                                        st.image(_uimg, width=380)
+                                for _nk in _cres.get("notes", []):
+                                    st.info(_(_nk))
+                                _crows = []
+                                for _p, _v in _cres["props"].items():
+                                    _nk2 = _v.get("note_key")
+                                    _crows.append({
+                                        _('start_from_prop'): f"{_p}{f' ({prop_unit(_p)})' if prop_unit(_p) else ''}",
+                                        _('blend_value'): (f"{_v['value']:.4g}"
+                                                           if _v["value"] is not None else "—"),
+                                        _('blend_rule'): _(_v.get("rule_key") or ""),
+                                        _('blend_note'): (_(_nk2).format(**(_v.get("note_args") or {}))
+                                                          if _nk2 else ""),
+                                    })
+                                if _crows:
+                                    st.dataframe(pd.DataFrame(_crows), hide_index=True,
+                                                 width='stretch')
+                                    st.download_button(
+                                        f"⬇️ {_('blend_download')}",
+                                        data=pd.DataFrame(_crows).to_csv(index=False).encode('utf-8'),
+                                        file_name="polsen_copolymer.csv", mime="text/csv",
+                                        key="copo_csv")
+                    elif _partner_smi and sga.is_valid_polymer_smiles(_partner_smi):
+                        _pa = {"smiles": best_poly_data['smiles'], "preds": preds}
+                        _pb_preds = compute_preds(_partner_smi, models, ALL_PROPS) or {}
+                        _pb = {"smiles": _partner_smi, "preds": _pb_preds}
+                        _res = _bl.blend_properties([_pa, _pb], [_wfrac, 1 - _wfrac])
+                        if _res:
+                            _m = _res["miscibility"]
+                            _icon = {"miscible": "🟢", "borderline": "🟡",
+                                     "immiscible": "🟠"}.get(_m["verdict"], "⚪")
+                            # blends.py is UI-agnostic and returns translation KEYS; look them
+                            # up here so the whole tab follows the selected language
+                            _verdict = _(f"blend_misc_{_m['verdict']}")
+                            st.subheader(f"{_icon} {_('blend_miscibility')}: {_verdict}")
+                            _ra = f"{_m['Ra']:.1f}" if _m.get("Ra") is not None else "-"
+                            st.caption(f"Hansen Ra = {_ra} MPa^½ · χ ≈ "
+                                       f"{_m['chi']:.2f} · {_('blend_confidence')}: {_m['confidence']}"
+                                       if _m.get("chi") is not None else f"Hansen Ra = {_ra}")
+                            _mnote = _(_m.get("note_key") or "") if _m.get("note_key") else _m["note"]
+                            if _m.get("caveat_key"):
+                                _ik = _m.get("interaction_key")
+                                _mnote += " " + _(_m["caveat_key"]).format(
+                                    inter=_(_ik) if _ik else (_m.get("interaction") or ""))
+                            st.info(_mnote)
+                            st.caption(_('blend_screen_caveat'))
+                            st.divider()
+                            st.markdown(f"**{_('blend_props')}** "
+                                        f"({_wfrac:.0%} / {1-_wfrac:.0%} w/w)")
+                            _rows = []
+                            for _p, _v in _res["props"].items():
+                                _rk, _nk = _v.get("rule_key"), _v.get("note_key")
+                                _ntxt = (_(_nk).format(**(_v.get("note_args") or {}))
+                                         if _nk else "")
+                                _rows.append({
+                                    _('start_from_prop'): f"{_p}{f' ({prop_unit(_p)})' if prop_unit(_p) else ''}",
+                                    # keep this column all-strings: mixing floats with a
+                                    # placeholder breaks Arrow serialisation in st.dataframe
+                                    _('blend_value'): (f"{_v['value']:.4g}"
+                                                       if _v["value"] is not None else "—"),
+                                    _('blend_rule'): _(_rk) if _rk else _v["rule"],
+                                    _('blend_note'): _ntxt,
+                                })
+                            st.dataframe(pd.DataFrame(_rows), hide_index=True,
+                                         width='stretch')
+                            st.download_button(
+                                f"⬇️ {_('blend_download')}",
+                                data=pd.DataFrame(_rows).to_csv(index=False).encode('utf-8'),
+                                file_name="polsen_blend.csv", mime="text/csv", key="blend_csv")
+                    elif _custom.strip():
+                        st.warning(f"⚠️ {_('start_from_invalid')}")
+
         with tab4:
             st.header(f"💾 {_('report_header')}")
             st.markdown(f"{_('report_desc')}")
             
             c1, c2 = st.columns(2)
-            
+
+            # --- flat CSV (one row): value + unit + measured error + target, per property ---
             export_dict = {
                 "SMILES": best_poly_data['smiles'],
                 "Toplam Hata": best_poly_data['total_error'],
-                "SA Score": get_sa_score_local(best_poly_data['smiles'])
+                "SA Score": get_sa_score_local(best_poly_data['smiles']),
             }
-            export_dict.update(preds)
+            _ad_sim_x = st.session_state.get('ad_sim')
+            _ad_state_x, _ad_icon_x = applicability(_ad_sim_x)   # never unpack into `_`
+            if SHOW_APPLICABILITY:
+                export_dict["Applicability domain"] = _ad_state_x
+                export_dict["Nearest-training similarity"] = (
+                    round(_ad_sim_x, 3) if _ad_sim_x is not None else "")
+            for _p in ALL_PROPS:
+                _u = prop_unit(_p)
+                _m, _s = prop_error(_p)
+                export_dict[f"{_p}{f' ({_u})' if _u else ''}"] = preds.get(_p)
+                if SHOW_RELIABILITY:          # error columns follow the reliability flag
+                    _m, _s = prop_error_for(_p, best_poly_data['smiles'])
+                    export_dict[f"{_p} +/- (typical error)"] = (
+                        (f"x/div {_m:.3g}" if _p in FOLD_PROPS else round(_m, 4))
+                        if _m is not None else "")
+                    export_dict[f"{_p} error source"] = (
+                        "molecule-specific (validated spread)" if _s == 'mol'
+                        else "out-of-sample (golden set)" if _s == 'gold'
+                        else "hold-out (in-distribution)" if _s == 'held'
+                        else ("in-sample (optimistic)" if _s == 'in' else ""))
+                export_dict[f"{_p} target"] = saved_targets.get(_p, "")
             df_best = pd.DataFrame([export_dict])
             csv_best = df_best.to_csv(index=False).encode('utf-8')
+
+            # --- full text report: everything a reader needs to judge the result ---
+            def _build_text_report():
+                L = []
+                L.append("POLSEN - POLYMER DESIGN REPORT")
+                L.append("=" * 62)
+                L.append(f"Repeat unit (SMILES): {best_poly_data['smiles']}")
+                _sel = smiles_to_selfies_safe(best_poly_data['smiles'])
+                if _sel:
+                    L.append(f"SELFIES             : {_sel}")
+                L.append(f"Total target error  : {best_poly_data['total_error']:.4f}")
+                L.append(f"SA score (1 easy - 10 hard): {get_sa_score_local(best_poly_data['smiles']):.2f}")
+                _seed_used = st.session_state.get('ga_seed_used')
+                if _seed_used:
+                    L.append(f"Random seed         : {_seed_used}  (reproducible run)")
+                _from_x = st.session_state.get('ga_started_from')
+                if _from_x:
+                    L.append(f"Optimised from      : {_from_x}")
+                L.append("")
+                if SHOW_APPLICABILITY:
+                    L.append("APPLICABILITY DOMAIN")
+                    L.append("-" * 62)
+                    L.append(f"  nearest-training-set similarity : "
+                             f"{f'{_ad_sim_x:.3f}' if _ad_sim_x is not None else 'n/a'}  -> {_ad_state_x}")
+                    if _ad_state_x != 'in':
+                        L.append("  NOTE: this polymer sits outside/near the edge of the training")
+                        L.append("        distribution. Absolute values (especially Refractive and EPS,")
+                        L.append("        which revert to the mean out-of-domain) may be unreliable;")
+                        L.append("        trust the direction/ranking more than the number.")
+                    L.append("")
+                L.append("PREDICTED PROPERTIES")
+                L.append("-" * 62)
+                if SHOW_RELIABILITY:
+                    L.append(f"  {'property':16} {'value':>10} {'unit':<14} {'+/-':>8}  {'error basis':<26} target")
+                else:
+                    L.append(f"  {'property':16} {'value':>10} {'unit':<14} target")
+                for _p in ALL_PROPS:
+                    _m, _s = prop_error_for(_p, best_poly_data['smiles'])
+                    _tg = saved_targets.get(_p, "")
+                    if SHOW_RELIABILITY:
+                        _basis = ("molecule-specific" if _s == 'mol'
+                                  else "out-of-sample (golden set)" if _s == 'gold'
+                                  else "hold-out (in-distribution)" if _s == 'held'
+                                  else ("in-sample (optimistic)" if _s == 'in' else "not measured"))
+                        _mtxt = ('-' if _m is None else
+                                 (f"x/{_m:.2g}" if _p in FOLD_PROPS else f"{_m:g}"))
+                        L.append(f"  {_p:16} {preds.get(_p, float('nan')):>10.2f} {prop_unit(_p):<14} "
+                                 f"{_mtxt:>8}  {_basis:<26} {_tg}")
+                    else:
+                        L.append(f"  {_p:16} {preds.get(_p, float('nan')):>10.2f} {prop_unit(_p):<14} {_tg}")
+                L.append("")
+                _checks_x = (st.session_state.get('verify_xtb') or {}).get('checks') or []
+                if _checks_x:
+                    L.append("INDEPENDENT VERIFICATION (this polymer)")
+                    L.append("-" * 62)
+                    for _c in _checks_x:
+                        _verdict = {'ok': 'consistent', 'warn': 'borderline', 'bad': 'DIVERGES'}.get(_c['status'], '')
+                        _b = f" +/- {_c['unc']:g}" if _c.get('unc') else " (physical floor)"
+                        L.append(f"  {_c['prop']:14} model {_c['model']:.2f} vs "
+                                 f"{_c['estimate']:.2f}{_b} [{_c.get('method', '')}] -> {_verdict}")
+                    L.append("")
+                try:
+                    _rt = retro.retro_decompose(best_poly_data['smiles'])
+                except Exception:
+                    _rt = None
+                L.append("RETROSYNTHESIS")
+                L.append("-" * 62)
+                if _rt:
+                    _r0 = _rt[0]
+                    _ex = {True: "EXACT (monomer re-polymerises to this exact repeat unit)",
+                           False: "APPROXIMATE (nearest-real monomer; re-polymerises to a close variant)",
+                           None: "n/a (step-growth / copolymer / branched)"}[_r0.get('exact')]
+                    L.append(f"  route      : {tr_retro(_r0['type'])}")
+                    L.append(f"  mechanism  : {tr_retro(_r0['mechanism'])}")
+                    L.append(f"  verified   : {'yes' if _r0.get('verified') else 'NO (tentative)'}")
+                    L.append(f"  round-trip : {_ex}")
+                    for _i, _mn in enumerate(_r0['monomers'], 1):
+                        L.append(f"  monomer {_i}  : {_mn}")
+                else:
+                    L.append("  no route found (novel / ambiguous backbone -- treat as a novelty flag)")
+                L.append("")
+                if SHOW_CHEM_REVIEW:
+                    try:
+                        import chem_review as _crx
+                        _rn = _crx.review(best_poly_data['smiles'], preds)
+                    except Exception:
+                        _rn = []
+                    if _rn:
+                        L.append("CHEMIST'S REVIEW")
+                        L.append("-" * 62)
+                        for _n in _rn:
+                            _tag = {"error": "[ERROR]", "warn": "[WARN] ", "info": "[note] "}[_n["level"]]
+                            _rm = (_(_n["key"]).format(**(_n.get("args") or {}))
+                                   if _n.get("key") else _n["message"])
+                            L.append(f"  {_tag} ({_n['topic']}) {_rm}")
+                        L.append("")
+                if SHOW_RELIABILITY:
+                    L.append("HOW TO READ THIS REPORT")
+                    L.append("-" * 62)
+                    L.append("  '+/-' is the TYPICAL error for a new polymer, not a confidence interval.")
+                    L.append("  'golden set' errors come from 18 canonical handbook polymers and are the")
+                    L.append("  honest out-of-sample numbers; 'in-sample' errors are optimistic lower bounds.")
+                    L.append("  See validation/GOLDEN_SET_VALIDATION.md and validation/XTB_VALIDATION.md.")
+                    L.append("")
+                L.append("Generated by Polsen. Predictions are ML estimates, not measurements.")
+                return "\n".join(L)
 
             with c1:
                 st.download_button(
                     label=f"{_('btn_download_csv')}",
                     data=csv_best,
-                    file_name="polimer_data.csv",
+                    file_name="polsen_polymer_data.csv",
                     mime="text/csv"
+                )
+            with c2:
+                st.download_button(
+                    label=f"📄 {_('btn_download_report')}",
+                    data=_build_text_report().encode('utf-8'),
+                    file_name="polsen_report.txt",
+                    mime="text/plain"
                 )
             
             st.divider()
@@ -2892,16 +3907,22 @@ if models:
 
             if retro_routes:
                 route = retro_routes[0]
-                monomer_info_text = (f"{_('yontem')}: {route['type']}\n"
-                                     f"{_('mechanism')}: {route['mechanism']}\n"
+                monomer_info_text = (f"{_('yontem')}: {tr_retro(route['type'])}\n"
+                                     f"{_('mechanism')}: {tr_retro(route['mechanism'])}\n"
                                      f"Monomers: {' . '.join(route['monomers'])}\n")
 
-                st.info(f"**{_('yontem')}:** {route['type']}")
-                st.write(f"**{_('mechanism')}:** {route['mechanism']}")
+                st.info(f"**{_('yontem')}:** {tr_retro(route['type'])}")
+                st.write(f"**{_('mechanism')}:** {tr_retro(route['mechanism'])}")
                 if route.get('verified', False):
                     st.caption(f"🔬 {_('retro_rule_method')}")
                 else:
                     st.caption(f"⚠️ {_('retro_tentative')}")
+                # round-trip: does re-polymerising the monomer reproduce THIS repeat unit?
+                _exact = route.get('exact')
+                if _exact is True:
+                    st.success(f"✅ {_('retro_exact')}")
+                elif _exact is False:
+                    st.info(f"≈ {_('retro_approx')}")
 
                 st.markdown(f"{_('baslangic_monomerleri')}")
                 img_retro = draw_retrosynthesis_grid(route['monomers'])
@@ -2909,19 +3930,23 @@ if models:
                     st.image(img_retro)
 
                 st.markdown(f"{_('commercial_check')}")
+                # Look every monomer up at once (cached) and link straight to PubChem, instead
+                # of a per-monomer button whose result vanished on the next rerun.
                 found_monomers = []
                 for i, m in enumerate(route['monomers']):
-                    col_code, col_check = st.columns([3, 1])
+                    col_code, col_check = st.columns([3, 2])
                     with col_code:
                         st.code(f"Monomer {i+1}: {m}")
                     with col_check:
-                        if st.button(f"{_('control')} #{i+1}", key=f"chk_{i}"):
-                            is_avail, cid, name = check_commercial_availability(m)
-                            if is_avail:
-                                st.success(f"{_('kayitli')}: {name}")
-                                found_monomers.append(name)
-                            else:
-                                st.error(f"{_('kayitli_degil')}")
+                        _ok, _cid, _nm, _url = lookup_monomer(m)
+                        if _ok:
+                            st.markdown(
+                                f"✅ [{_nm or ('CID ' + str(_cid))}]({_url}) "
+                                f"<span style='opacity:.6;font-size:.85em'>CID {_cid}</span>",
+                                unsafe_allow_html=True)
+                            found_monomers.append(f"{_nm or _cid} (CID {_cid})")
+                        else:
+                            st.markdown(f"❔ {_('kayitli_degil')} — [{_('pubchem_search')}]({_url})")
 
                 if found_monomers:
                     monomer_info_text += f"{_('kayitli')}: {', '.join(found_monomers)}"

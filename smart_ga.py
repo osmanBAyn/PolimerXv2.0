@@ -204,10 +204,16 @@ _UNSTABLE_SMARTS = [Chem.MolFromSmarts(s) for s in [
 
 @functools.lru_cache(maxsize=100000)
 def is_chemically_sane(smi):
-    """Reject repeat units containing unstable / implausible motifs."""
+    """Reject repeat units containing unstable / implausible motifs, or a net charge."""
     try:
         mol = Chem.MolFromSmiles(smi.replace("*", "[H]"))
         if mol is None:
+            return False
+        # A neutral polymer repeat unit must have NET formal charge 0. This kills GA
+        # artifacts like naked alkoxides [O-] or quaternary N+ without a counter-ion
+        # (the property models are all trained on neutral polymers), while charge-
+        # separated but net-neutral groups -- nitro, N-oxide, azide -- still pass.
+        if Chem.GetFormalCharge(mol) != 0:
             return False
         for patt in _UNSTABLE_SMARTS:
             if patt is not None and mol.HasSubstructMatch(patt):

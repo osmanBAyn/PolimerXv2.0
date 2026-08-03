@@ -55,6 +55,43 @@ def is_valid_monomer(smi):
     return m is not None and m.GetNumHeavyAtoms() >= 2
 
 
+def _linearize_multistar(smi):
+    """
+    A repeat unit with >2 '*' is a branched / network junction. Keep the two '*' that are
+    farthest apart as the linear main-chain ends and cap the rest (branch / crosslink points)
+    with H, so the backbone can be decomposed by the normal rules. Returns a 2-'*' SMILES,
+    or None. The caller labels the resulting route as branched/crosslinked.
+    """
+    mol = _mol(smi)
+    if mol is None:
+        return None
+    stars = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 0]
+    if len(stars) <= 2:
+        return None
+    best = None
+    for i in range(len(stars)):
+        for j in range(i + 1, len(stars)):
+            try:
+                pl = len(Chem.GetShortestPath(mol, stars[i], stars[j]))
+            except Exception:
+                pl = 0
+            if pl and (best is None or pl > best[0]):
+                best = (pl, stars[i], stars[j])
+    if best is None:
+        return None
+    keep = {best[1], best[2]}
+    rw = Chem.RWMol(mol)
+    for s in sorted((s for s in stars if s not in keep), reverse=True):
+        rw.RemoveAtom(s)                       # drop -> neighbour gains an implicit H (branch cap)
+    m = rw.GetMol()
+    try:
+        Chem.SanitizeMol(m)
+    except Exception:
+        return None
+    out = Chem.MolToSmiles(m)
+    return out if out.count("*") == 2 else None
+
+
 # carbonyl carbon single-bonded to O or N (the cleavable acyl-heteroatom bond)
 _ACYL_HETERO = Chem.MolFromSmarts("[CX3](=[OX1])[#7,#8]")
 # ether C-O-C (O not part of a carbonyl/ester) -> polyether / poly(arylene ether).
@@ -271,15 +308,22 @@ def _classify_ab(smi):
     return None
 
 
+_SI_O = Chem.MolFromSmarts("[Si][OX2]")           # a real siloxane linkage
+
+
 def _siloxane_monomer(smi):
-    """Silicone: backbone contains Si; recover the silanediol (R2Si(OH)2) monomer."""
+    """Silicone: an Si-O BACKBONE (not merely a pendant Si); recover the silanediol monomer."""
     mol = _mol(smi)
     if mol is None:
         return None
     stars = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 0]
     if len(stars) != 2:
         return None
-    if not any(a.GetAtomicNum() == 14 for a in mol.GetAtoms()):   # needs silicon
+    # require an actual Si-O linkage AND at least one chain end on Si/O; otherwise a
+    # pendant-Si all-carbon polymer (e.g. poly(vinyl-TMS)) is a VINYL polymer, not a silicone.
+    if _SI_O is None or not mol.HasSubstructMatch(_SI_O):
+        return None
+    if not any(mol.GetAtomWithIdx(s).GetNeighbors()[0].GetAtomicNum() in (8, 14) for s in stars):
         return None
     for s in stars:
         n = mol.GetAtomWithIdx(s).GetNeighbors()[0]
@@ -450,6 +494,170 @@ def _addition_monomers(smi):
     return frags if frags else None
 
 
+def _polyolefin_monomers(smi):
+    """
+    Fallback for all-carbon SATURATED backbones that _vinyl_monomer / _addition_monomers
+    miss: (a) geminal 1,1-disubstitution (both '*' on one carbon) -> CH2=C(R)(R'), the
+    acrylate/methacrylate-style monomer; (b) odd-length backbones -> olefin comonomers with
+    a propene-type 3-carbon tail for the leftover carbon. A plausible, atom-conserving
+    addition-polymer route; runs only after every exact (ester/amide/ether/...) rule fails.
+    """
+    mol = _mol(smi)
+    if mol is None:
+        return None
+    stars = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 0]
+    if len(stars) != 2:
+        return None
+    nb = []
+    for s in stars:
+        ns = mol.GetAtomWithIdx(s).GetNeighbors()
+        if not ns:
+            return None
+        nb.append(ns[0].GetIdx())
+    c0, c1 = nb
+    if mol.GetAtomWithIdx(c0).GetAtomicNum() != 6 or mol.GetAtomWithIdx(c1).GetAtomicNum() != 6:
+        return None
+
+    # (a) geminal: -C(R)(R')- single-carbon repeat -> 1,1-disubstituted alkene CH2=C(R)(R')
+    if c0 == c1:
+        mol.GetAtomWithIdx(c0).SetAtomMapNum(99)
+        rw = Chem.RWMol(mol)
+        for s in sorted(stars, reverse=True):
+            rw.RemoveAtom(s)
+        try:
+            cidx = next(a.GetIdx() for a in rw.GetAtoms() if a.GetAtomMapNum() == 99)
+        except StopIteration:
+            return None
+        nc = rw.AddAtom(Chem.Atom(6))
+        rw.AddBond(cidx, nc, Chem.BondType.DOUBLE)          # add the =CH2
+        rw.GetAtomWithIdx(cidx).SetAtomMapNum(0)
+        m = rw.GetMol()
+        try:
+            Chem.SanitizeMol(m)
+        except Exception:
+            return None
+        f = _canon(m)
+        return [f] if f and is_valid_monomer(f) else None
+
+    # (b) odd-length saturated all-carbon backbone
+    try:
+        path = list(Chem.GetShortestPath(mol, c0, c1))
+    except Exception:
+        return None
+    L = len(path)
+    if L < 3 or L % 2 == 0:                                  # even is _addition_monomers' job
+        return None
+    if any(mol.GetAtomWithIdx(i).GetAtomicNum() != 6 for i in path):
+        return None
+    for i in range(L - 1):
+        b = mol.GetBondBetweenAtoms(path[i], path[i + 1])
+        if b is None or b.GetBondType() != Chem.BondType.SINGLE:
+            return None                                     # backbone C=C -> diene/ROMP, not here
+    for k, idx in enumerate(path):
+        mol.GetAtomWithIdx(idx).SetAtomMapNum(k + 1)
+    rw = Chem.RWMol(mol)
+    for s in sorted(stars, reverse=True):
+        rw.RemoveAtom(s)
+    pm = {a.GetAtomMapNum(): a.GetIdx() for a in rw.GetAtoms() if a.GetAtomMapNum()}
+    p = [pm[k + 1] for k in range(L)]
+    starts = list(range(0, L - 1, 2))                       # pair starts; last pair absorbs the odd tail
+    for i, s in enumerate(starts):
+        b = rw.GetBondBetweenAtoms(p[s], p[s + 1])
+        if b is not None:
+            b.SetBondType(Chem.BondType.DOUBLE)             # restore each monomer's C=C
+        if i < len(starts) - 1 and rw.GetBondBetweenAtoms(p[s + 1], p[s + 2]) is not None:
+            rw.RemoveBond(p[s + 1], p[s + 2])               # cut between monomers
+    for a in rw.GetAtoms():
+        a.SetAtomMapNum(0)
+    m = rw.GetMol()
+    try:
+        Chem.SanitizeMol(m)
+    except Exception:
+        return None
+    frags = [_canon(f) for f in Chem.GetMolFrags(m, asMols=True, sanitizeFrags=True)]
+    frags = [f for f in frags if f and is_valid_monomer(f)]
+    return frags if frags else None
+
+
+def _quinodimethane_monomer(smi):
+    """
+    Poly(xylylene) / parylene: a -CaR2-[benzene]-CbR'2- backbone where the two benzylic
+    carbons sit on ORTHO or PARA positions of one aromatic ring comes from an o-/p-quinodimethane
+    monomer. Reconstruct it: make the ring quinoid and put exocyclic C=C on the two benzylic
+    carbons. Meta has no quinodimethane. Bad geometries fail sanitisation -> None (never wrong).
+    """
+    mol = _mol(smi)
+    if mol is None:
+        return None
+    stars = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 0]
+    if len(stars) != 2:
+        return None
+    nb = [mol.GetAtomWithIdx(s).GetNeighbors()[0].GetIdx()
+          for s in stars if mol.GetAtomWithIdx(s).GetNeighbors()]
+    if len(nb) != 2 or nb[0] == nb[1]:
+        return None
+    ca, cb = nb
+    if any(mol.GetAtomWithIdx(i).GetAtomicNum() != 6 or mol.GetAtomWithIdx(i).GetIsAromatic()
+           for i in (ca, cb)):
+        return None
+    ra = [x.GetIdx() for x in mol.GetAtomWithIdx(ca).GetNeighbors() if x.GetIsAromatic()]
+    rb = [x.GetIdx() for x in mol.GetAtomWithIdx(cb).GetNeighbors() if x.GetIsAromatic()]
+    target = None
+    for ring in mol.GetRingInfo().AtomRings():
+        if len(ring) != 6 or not all(mol.GetAtomWithIdx(i).GetIsAromatic() for i in ring):
+            continue
+        A = [i for i in ra if i in ring]
+        B = [i for i in rb if i in ring]
+        if A and B and A[0] != B[0]:
+            pos = {a: k for k, a in enumerate(ring)}
+            d = abs(pos[A[0]] - pos[B[0]]); d = min(d, 6 - d)
+            if d in (1, 3):                       # ortho / para only
+                target = (ring, A[0], B[0])
+                break
+    if target is None:
+        return None
+    ring, r_a, r_b = target
+    rw = Chem.RWMol(mol)
+    try:
+        Chem.Kekulize(rw, clearAromaticFlags=True)
+    except Exception:
+        return None
+    for i in list(ring) + [ca, cb]:
+        rw.GetAtomWithIdx(i).SetIsAromatic(False)
+    # cyclic order of the ring starting at r_a
+    ringset = set(ring)
+    seq, prev, cur = [r_a], None, r_a
+    while len(seq) < 6:
+        nxts = [x.GetIdx() for x in rw.GetAtomWithIdx(cur).GetNeighbors()
+                if x.GetIdx() in ringset and x.GetIdx() != prev]
+        if not nxts:
+            return None
+        seq.append(nxts[0]); prev, cur = cur, nxts[0]
+    if len(seq) != 6 or r_b not in seq:
+        return None
+    p = seq.index(r_b)
+    exo = {0, p}                                  # ring positions bearing the exocyclic C=C
+    rw.GetBondBetweenAtoms(ca, r_a).SetBondType(Chem.BondType.DOUBLE)
+    rw.GetBondBetweenAtoms(cb, r_b).SetBondType(Chem.BondType.DOUBLE)
+    for i in range(6):
+        rw.GetBondBetweenAtoms(seq[i], seq[(i + 1) % 6]).SetBondType(Chem.BondType.SINGLE)
+    used = set()
+    for i in range(6):
+        j = (i + 1) % 6
+        if i in exo or j in exo or i in used or j in used:
+            continue
+        rw.GetBondBetweenAtoms(seq[i], seq[j]).SetBondType(Chem.BondType.DOUBLE)
+        used.update((i, j))
+    for s in sorted(stars, reverse=True):
+        rw.RemoveAtom(s)
+    m = rw.GetMol()
+    try:
+        Chem.SanitizeMol(m)
+    except Exception:
+        return None
+    return _canon(m)
+
+
 def _backbone_thioester_bonds(mol):
     """Backbone -C(=O)-S- bonds (cut acyl-S, cap acyl C with -OH -> acid + thiol)."""
     bonds = []
@@ -562,6 +770,20 @@ def retro_decompose(smi, verified_only=False):
     Returns [] when no disconnection is found.
     """
     if not smi:
+        return []
+
+    # Branched / network unit (>2 '*'): decompose the main chain, flag the branch points.
+    if smi.count("*") > 2:
+        lin = _linearize_multistar(smi)
+        if lin:
+            sub = retro_decompose(lin, verified_only=verified_only)
+            if sub:
+                r = dict(sub[0])
+                r["type"] = r["type"] + " (branched/crosslinked)"
+                r["mechanism"] = r["mechanism"] + "; crosslinked/branched at the extra connection point(s)"
+                r["method"] = r["method"] + "; extra '*' capped as branch points"
+                r["exact"] = None      # main chain only; branch points were capped away
+                return [r]
         return []
 
     route = None
@@ -679,6 +901,27 @@ def retro_decompose(smi, verified_only=False):
                      "monomer_roles": ["olefin monomer"] if n == 1 else ["olefin comonomers"],
                      "method": "addition backbone -> olefin(s)"}
 
+    # 2b. All-carbon backbone fallback: geminal 1,1-disubstitution or odd-length -> olefin(s).
+    if route is None:
+        poly = _polyolefin_monomers(smi)
+        if poly:
+            uniq = list(dict.fromkeys(poly))
+            n = len(uniq)
+            route = {"type": "Vinyl / addition polymer" if n == 1 else "Vinyl / addition copolymer",
+                     "mechanism": "Chain-growth addition of olefin monomer(s)",
+                     "monomers": uniq, "_frag_heavy": _total_heavy(poly),
+                     "monomer_roles": ["olefin monomer"] if n == 1 else ["olefin comonomers"],
+                     "method": "all-carbon backbone -> olefin(s)"}
+
+    # 2c. Poly(xylylene) / parylene: benzylic carbons on one ring -> quinodimethane.
+    if route is None:
+        qdm = _quinodimethane_monomer(smi)
+        if qdm and is_valid_monomer(qdm):
+            route = {"type": "Poly(xylylene) (parylene)",
+                     "mechanism": "Polymerisation of an o-/p-quinodimethane (from a [2.2]cyclophane)",
+                     "monomers": [qdm], "monomer_roles": ["quinodimethane (xylylene)"],
+                     "method": "benzylic backbone -> quinodimethane"}
+
     # 3. Aryl-aryl coupled backbone -> dihaloarene.
     if route is None:
         aryl = _aryl_coupling_monomer(smi)
@@ -694,6 +937,9 @@ def retro_decompose(smi, verified_only=False):
     ok, reason = verify_route(smi, route)
     route["verified"] = ok
     route["verify_reason"] = reason
+    # True = re-polymerising the monomer provably reproduces this repeat unit;
+    # False = reconstructs to a near-miss (honest "nearest-real"); None = n/a.
+    route["exact"] = roundtrip_check(smi, route)
     if verified_only and not ok:
         return []
     return [route]
@@ -717,6 +963,76 @@ def _total_heavy(smiles_list):
         if m is not None:
             total += m.GetNumHeavyAtoms()
     return total
+
+
+def _open_and_star(m, bonds, star_atoms):
+    """Set each given bond to single and attach a '*' to each atom index; -> canonical SMILES."""
+    rw = Chem.RWMol(m)
+    for i, j in bonds:
+        b = rw.GetBondBetweenAtoms(i, j)
+        if b is None:
+            return None
+        b.SetBondType(Chem.BondType.SINGLE)
+    for idx in star_atoms:
+        s = rw.AddAtom(Chem.Atom(0))
+        rw.AddBond(idx, s, Chem.BondType.SINGLE)
+    mm = rw.GetMol()
+    try:
+        Chem.SanitizeMol(mm)
+        return Chem.MolToSmiles(mm)
+    except Exception:
+        return None
+
+
+def roundtrip_check(polymer_smi, route):
+    """
+    Forward round-trip: re-polymerise the proposed monomer and see whether it reproduces
+    the original repeat unit. Returns True (exact), False (reconstructs to something else
+    -> 'nearest-real' approximation), or None (not round-trippable here: step-growth,
+    copolymer or branched routes, where several repeat units are equally consistent).
+
+    This is a STRONGER statement than `verified` (which only checks functional groups +
+    atom conservation), so the UI can distinguish a provably-exact route from a plausible one.
+    """
+    t = route.get("type", "")
+    mons = route.get("monomers") or []
+    if "copolymer" in t or "branched" in t or len(mons) != 1:
+        return None
+    m = Chem.MolFromSmiles(mons[0])
+    if m is None:
+        return None
+    orig = Chem.MolFromSmiles(str(polymer_smi))
+    if orig is None:
+        return None
+    orig_c = Chem.MolToSmiles(orig)
+
+    cands = []
+    if t.startswith("Poly(xylylene)"):
+        bonds, stars = [], []
+        for b in m.GetBonds():
+            if b.GetBondType() != Chem.BondType.DOUBLE:
+                continue
+            a1, a2 = b.GetBeginAtom(), b.GetEndAtom()
+            if a1.GetIsAromatic() ^ a2.GetIsAromatic():        # exocyclic C=c
+                bonds.append((a1.GetIdx(), a2.GetIdx()))
+                stars.append(a1.GetIdx() if not a1.GetIsAromatic() else a2.GetIdx())
+        if len(bonds) == 2:
+            r = _open_and_star(m, bonds, stars)
+            if r:
+                cands.append(r)
+    elif t.startswith("Vinyl") and "diene" not in t:
+        for b in m.GetBonds():                                  # open each candidate C=C
+            if b.GetBondType() != Chem.BondType.DOUBLE:
+                continue
+            a1, a2 = b.GetBeginAtom(), b.GetEndAtom()
+            if (a1.GetAtomicNum() == 6 and a2.GetAtomicNum() == 6
+                    and not a1.GetIsAromatic() and not a2.GetIsAromatic()):
+                r = _open_and_star(m, [(a1.GetIdx(), a2.GetIdx())], [a1.GetIdx(), a2.GetIdx()])
+                if r:
+                    cands.append(r)
+    if not cands:
+        return None
+    return orig_c in cands
 
 
 def verify_route(polymer_smi, route):
@@ -765,8 +1081,8 @@ def verify_route(polymer_smi, route):
         ok = _count_groups(mols, "[CX3;R]=[CX3;R]") >= 1
         reason = "ROMP monomer must be a cyclic olefin"
     elif t.startswith("Polysiloxane"):
-        ok = _count_groups(mols, "[Si]") >= 1
-        reason = "siloxane monomer must contain Si"
+        ok = _count_groups(mols, "[Si][OX2]") >= 1     # silanol / Si-O, not a pendant Si
+        reason = "siloxane monomer must contain an Si-O (silanol)"
     elif t.startswith("Polythioester"):
         ok = cooh >= 1 and _count_groups(mols, "[SX2H]") >= 1
         reason = "thioester monomers must carry -COOH and -SH"
@@ -776,6 +1092,10 @@ def verify_route(polymer_smi, route):
     elif t.startswith("Polyimine"):
         ok = _count_groups(mols, "[CX3]=[OX1]") >= 1 and nh >= 1
         reason = "azomethine needs a carbonyl (aldehyde/ketone) + amine"
+    elif t.startswith("Poly(xylylene)"):
+        # quinodimethane keeps its ring aromatic, so the exocyclic bond reads C=c (aromatic partner)
+        ok = cc >= 1 or _count_groups(mols, "[CX3]=[c]") >= 1
+        reason = "quinodimethane monomer must contain an exocyclic C=C"
     else:
         ok, reason = True, "ok"
 

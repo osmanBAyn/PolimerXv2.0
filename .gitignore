@@ -1,0 +1,32 @@
+# --- NOT part of Polsen ---------------------------------------------------------------
+# An unrelated project that happens to sit in this folder (399 MB, incl. a 57.8 MB zip that
+# would trip GitHub's 50 MB file warning).
+worldmapper_quiz/
+
+# --- development artefacts, not needed to run or deploy ---------------------------------
+versions/                     # version snapshots (171 MB) — keep locally, not in the repo
+models_bagged/unused/         # bags trained but NOT used by the app (30 MB)
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.log
+.venv/
+venv/
+env/
+.DS_Store
+.idea/
+.vscode/
+
+# --- secrets --------------------------------------------------------------------------
+.env
+.streamlit/secrets.toml
+*.key
+
+# NOTE what is deliberately NOT ignored, because the app needs it at runtime:
+#   *.joblib                                  the 16 property models
+#   models_bagged/bagged_*.joblib             uncertainty companions
+#   models_bagged/companion_calibration.json
+#   validation/uncertainty_calibration.json   per-molecule error bars
+#   fpscores.pkl.gz                           SA-score data
+# validation/*.md, tests/ and md/ are kept too: they are the evidence base and are small.

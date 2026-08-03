@@ -1,4 +1,20 @@
-.git
-__pycache__
-venv
+# Keep the deployed image small — these are all development-only.
+versions/                     # version snapshots (v4 alone is >100 MB)
+models_bagged/unused/         # bags that were trained but are NOT used by the app (~30 MB)
+__pycache__/
+**/__pycache__/
 *.pyc
+.git/
+.gitignore
+worldmapper_quiz/
+md/                           # offline MD pipeline; never called by the app
+# validation/ is dev-only EXCEPT uncertainty_calibration.json, which the app loads at
+# runtime for the per-molecule error bars -- exclude the scripts, keep the calibration.
+validation/*.py
+validation/*.md
+validation/__pycache__/
+validation/*.csv
+tests/
+*.log
+.venv/
+venv/
