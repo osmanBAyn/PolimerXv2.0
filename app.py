@@ -2590,6 +2590,11 @@ def calculate_novelty_optimized(generated_smiles, ref_smiles_list):
 st.markdown(f'<h1 class="main-title"> POLSEN <br><span style="font-size:1.5rem; color:#666; font-weight:400;">{_("app_subtitle")}</span></h1>', unsafe_allow_html=True)
 
 models = load_critic_models()
+if not models:
+    # load_critic_models() already rendered the real reason (a missing file, or a missing
+    # unpickling dependency such as `dill`). Stop here rather than letting the next line raise
+    # "'NoneType' object has no attribute 'keys'", which buries that message under a traceback.
+    st.stop()
 ALL_PROPS = list(models.keys())
 
 # --- Manual polymer analysis (predict properties + retrosynthesis for a user SMILES) ---
