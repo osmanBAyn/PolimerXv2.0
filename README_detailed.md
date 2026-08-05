@@ -63,6 +63,7 @@ models_bagged/        bagged companion ensembles (uncertainty only, not predicti
 tests/                regression suites — run after any change
 validation/           evidence: how good the models are, and how we know
 md/                   offline molecular-dynamics pipeline (Tg / CTE / density)
+seed_population.json.gz  precomputed GA starting population (no runtime download)
 Dockerfile            container build (installs xtb); .dockerignore trims the image
 versions/             snapshots — v4 = core app fully validated (pre-blend, see its
                       VERSION.md); v3_son = before the bagged-ensemble retrain
@@ -104,6 +105,34 @@ railway up          # or: docker build -t polsen . && docker run -p 8080:8080 po
 `.dockerignore` keeps the image lean by dropping `versions/`, `models_bagged/unused/`, `md/`,
 `tests/` and the validation scripts — but **keeps `validation/uncertainty_calibration.json`**,
 which the app loads at runtime for the per-molecule error bars. Build context ≈ 99 MB.
+
+### Memory: the container needs ~1 GB
+
+Measured on the real Streamlit server, in a venv built from exactly this `requirements.txt`
+(no torch), running the **default** search — NSGA-II, population 100, 10 generations, Tg only:
+
+| stage | RSS |
+|---|---|
+| after the first page render (idle) | **461 MB** |
+| peak during one default search | **699 MB** |
+| after a second search | ~730 MB |
+
+Most of that floor is unavoidable: pandas + scikit-learn + RDKit + XGBoost + LightGBM +
+Streamlit alone are ~205 MB before a single model is loaded, and the 16 property models add
+~180 MB more. A 512 MB container will boot and serve the page, then be **OOM-killed the moment
+someone runs a search** — which looks like a 502 with the session resetting to the home page,
+not like an error. Give the service **at least 1 GB, ideally 2 GB.**
+
+### No network at runtime
+
+The GA seed population ships as `seed_population.json.gz` (140 KB). It used to be downloaded
+from HuggingFace on every cold start, which pulled all 18 splits of the dataset to read one,
+required outbound network from the container, and delayed the first render by ~25 s. Removing it
+cut cold start from ~41 s to ~17 s and idle memory from 498 MB to 461 MB, and let `datasets` /
+`huggingface-hub` come out of `requirements.txt` entirely. Regenerate the file with
+`python validation/make_seed_population.py` if the upstream dataset ever changes.
+
+Note that `pyarrow` stays — Streamlit itself imports it for `st.line_chart` / `st.dataframe`.
 
 `USE_T5_RETRO` is **off** and `torch` / `transformers` / `google-generativeai` are commented out
 of `requirements.txt`, so the image carries no multi-GB ML runtime: the T5 was trained on

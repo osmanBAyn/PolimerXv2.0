@@ -11,8 +11,12 @@ lightgbm==4.6.0
 rdkit==2025.9.3
 selfies==2.2.0
 deap==1.4.3
-datasets==4.4.1
-huggingface-hub==0.36.0
+# datasets / huggingface-hub: NOT needed at runtime any more. The GA seed population ships as
+# seed_population.json.gz (140 KB, see validation/make_seed_population.py). Downloading it live
+# cost ~25 s of cold start, required outbound network, and pulled pyarrow+fsspec into memory
+# (~33 MB RSS) just to read a list of strings. Uncomment only to re-enable the live fallback.
+# datasets==4.4.1
+# huggingface-hub==0.36.0
 pubchempy==1.0.5
 stmol==0.0.9
 py3Dmol==2.5.3

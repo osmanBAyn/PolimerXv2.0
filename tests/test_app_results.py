@@ -49,11 +49,17 @@ st.download_button = _dl
 st.stop = lambda *a, **k: None; st.set_page_config = lambda *a, **k: None; st.sidebar = st; st.__path__ = []
 _cc = _St("streamlit.components"); _cc.__path__ = []; _v = _St("streamlit.components.v1"); _cc.v1 = _v; st.components = _cc
 sys.modules["streamlit"] = st; sys.modules["streamlit.components"] = _cc; sys.modules["streamlit.components.v1"] = _v
-import datasets as d
-_r = d.load_dataset
-d.load_dataset = lambda *a, **k: type("D", (), {"to_pandas": lambda s: pd.DataFrame(
-    {"p_smiles": ["*CC(c1ccccc1)*", "*CCO*", "*OCCOC(=O)c1ccc(C(=O)*)cc1"]})})() \
-    if (a and "Tahmini" in str(a[0]) and k.get("split") == "Tg") else _r(*a, **k)
+# The app reads its seed population from seed_population.json.gz -- no network, no `datasets`.
+# We still stub the HuggingFace path when the package happens to be installed, so that a missing
+# or corrupt seed file can never turn this test into a silent 25 s download.
+try:
+    import datasets as d
+    _r = d.load_dataset
+    d.load_dataset = lambda *a, **k: type("D", (), {"to_pandas": lambda s: pd.DataFrame(
+        {"p_smiles": ["*CC(c1ccccc1)*", "*CCO*", "*OCCOC(=O)c1ccc(C(=O)*)cc1"]})})() \
+        if (a and "Tahmini" in str(a[0]) and k.get("split") == "Tg") else _r(*a, **k)
+except ImportError:
+    pass          # expected in a deployment-equivalent environment
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ)
 

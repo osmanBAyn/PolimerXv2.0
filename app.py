@@ -32,7 +32,10 @@ from rdkit import RDLogger
 import selfies as sf
 import smart_ga as sga  # chemistry-aware GA operators: seeding, fragment mutation, structure preservation
 import retro            # rule-based polymer retrosynthesis (reliable disconnection to real monomers)
-from datasets import load_dataset
+# NB: `datasets` is deliberately NOT imported here. The seed population now ships as
+# seed_population.json.gz; the HuggingFace path is a lazy fallback inside
+# get_initial_population(), so the container never pays for pyarrow/fsspec at import time.
+import gzip
 import rdkit.Chem.rdChemReactions as rdChemReactions
 import sys
 RDLogger.DisableLog('rdApp.*')
@@ -286,20 +289,40 @@ def inject_custom_css():
 
 inject_custom_css()
 N_BITS = 2048 
+SEED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seed_population.json.gz")
+
+
 @st.cache_data
 def get_initial_population():
-    """Verisetini sadece bir kez indirir ve önbelleğe alır."""
-    repo_id = "OsBaran/Polimer-Ozellik-Tahmini"
-    tg_data = load_dataset(repo_id, split="Tg")
-    df = tg_data.to_pandas()
-    col_name = 'p_smiles' if 'p_smiles' in df.columns else 'smiles'
-    raw_smiles = df[col_name].tolist()
-    valid_selfies = []
-    for s in raw_smiles:
-        sf_str = smiles_to_selfies_safe(s)
-        if sf_str:
-            valid_selfies.append(sf_str)
-    return valid_selfies, raw_smiles 
+    """
+    GA başlangıç popülasyonu: önceden hesaplanmış dosyadan okunur.
+
+    The seed population used to be pulled from HuggingFace on every cold start. That was a
+    liability in production: it downloaded ALL 18 splits of the repo to read one, took ~25 s
+    before the first page could render, needed outbound network from the container, and dragged
+    in datasets+pyarrow+fsspec (~33 MB of RSS, far more on disk) for a single list of strings.
+
+    seed_population.json.gz (140 KB) is that exact list, precomputed -- byte-identical SMILES,
+    SELFIES and order. Regenerate with validation/make_seed_population.py if the dataset changes.
+    """
+    try:
+        with gzip.open(SEED_FILE, "rt", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return payload["selfies"], payload["smiles"]
+    except Exception as exc:
+        # Fall back to the live dataset so a missing/corrupt file degrades instead of dying.
+        # `datasets` is imported HERE, not at module scope, so the normal path never pays for it.
+        try:
+            from datasets import load_dataset
+            tg_data = load_dataset("OsBaran/Polimer-Ozellik-Tahmini", split="Tg")
+            df = tg_data.to_pandas()
+            col_name = 'p_smiles' if 'p_smiles' in df.columns else 'smiles'
+            raw_smiles = df[col_name].tolist()
+            valid_selfies = [sf for sf in (smiles_to_selfies_safe(s) for s in raw_smiles) if sf]
+            return valid_selfies, raw_smiles
+        except Exception:
+            st.error(f"Başlangıç popülasyonu yüklenemedi / could not load seed population: {exc}")
+            return [], []
 def _force_single_thread(model):
     """Set n_jobs/n_threads=1 on a model (and pipeline steps) to avoid pool-startup
     overhead on the GA's single-row predictions."""
