@@ -106,33 +106,46 @@ railway up          # or: docker build -t polsen . && docker run -p 8080:8080 po
 `tests/` and the validation scripts — but **keeps `validation/uncertainty_calibration.json`**,
 which the app loads at runtime for the per-molecule error bars. Build context ≈ 99 MB.
 
-### Memory: the container needs ~1 GB
+### Memory profile
 
 Measured on the real Streamlit server, in a venv built from exactly this `requirements.txt`
 (no torch), running the **default** search — NSGA-II, population 100, 10 generations, Tg only:
 
 | stage | RSS |
 |---|---|
-| after the first page render (idle) | **461 MB** |
-| peak during one default search | **699 MB** |
+| after the first page render (idle) | ~460–500 MB |
+| peak during one default search | ~700 MB |
 | after a second search | ~730 MB |
 
 Most of that floor is unavoidable: pandas + scikit-learn + RDKit + XGBoost + LightGBM +
 Streamlit alone are ~205 MB before a single model is loaded, and the 16 property models add
-~180 MB more. A 512 MB container will boot and serve the page, then be **OOM-killed the moment
-someone runs a search** — which looks like a 502 with the session resetting to the home page,
-not like an error. Give the service **at least 1 GB, ideally 2 GB.**
+~180 MB more. Give the service **at least 1 GB**; the production deployment has 8 GB.
 
-### No network at runtime
+### Dependencies: beware undeclared transitive imports
 
-The GA seed population ships as `seed_population.json.gz` (140 KB). It used to be downloaded
-from HuggingFace on every cold start, which pulled all 18 splits of the dataset to read one,
-required outbound network from the container, and delayed the first render by ~25 s. Removing it
-cut cold start from ~41 s to ~17 s and idle memory from 498 MB to 461 MB, and let `datasets` /
-`huggingface-hub` come out of `requirements.txt` entirely. Regenerate the file with
+Two packages the app genuinely needs are not declared by anything that obviously requires them,
+and both have taken the deployment down once:
+
+* **`dill`** — needed to unpickle 5 of the 16 models (`xgb_td`, `xgb_tm` and the three band
+  gaps). It normally arrives via `datasets`; when `datasets` was removed, every model load
+  failed with `No module named 'dill'`.
+* **`ipython_genutils`** — imported by `ipywidgets 7.6.3` (which `stmol` pins) but never
+  declared by it, so pip does not install it and the app dies at import.
+
+Both are now pinned explicitly. **Before changing `requirements.txt`, build a brand-new venv
+from it and check that all 16 models load and the three test suites pass** — `pip uninstall`
+leaves dependencies behind, so a pruned environment will pass a test the container fails.
+
+### The seed population ships with the repo
+
+`seed_population.json.gz` (140 KB) holds the GA's starting population. It used to be downloaded
+from HuggingFace on every cold start, which fetched all 18 splits of the dataset to read one,
+required outbound network from the container, and delayed the first render by ~25 s — cold start
+went from ~41 s to ~17 s once it was baked in. `datasets` remains installed (it supplies `dill`
+and backs the fallback path) but is no longer imported at module scope. Regenerate the file with
 `python validation/make_seed_population.py` if the upstream dataset ever changes.
 
-Note that `pyarrow` stays — Streamlit itself imports it for `st.line_chart` / `st.dataframe`.
+Note that `pyarrow` must stay — Streamlit itself imports it for `st.line_chart` / `st.dataframe`.
 
 `USE_T5_RETRO` is **off** and `torch` / `transformers` / `google-generativeai` are commented out
 of `requirements.txt`, so the image carries no multi-GB ML runtime: the T5 was trained on
