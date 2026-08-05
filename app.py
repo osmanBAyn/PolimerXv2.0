@@ -60,7 +60,7 @@ from lang_dict import LANGUAGES
 # =====================================================================================
 # CONFIG -- toggle app features here (safe to edit before publishing)
 # =====================================================================================
-SHOW_RELIABILITY = True    # per-property reliability badges + legend + warnings AND the
+SHOW_RELIABILITY = False    # per-property reliability badges + legend + warnings AND the
                             #   "± typical error" bars on values (and their export columns)
 SHOW_APPLICABILITY = True   # applicability-domain banner: warn when the polymer is outside
                             #   the training distribution (extrapolation) -- see PROP_MAE/AD_*
