@@ -83,6 +83,14 @@ melting point at all. That is now flagged.
 * **Reactive pairs that cannot coexist in a stable repeat unit** — pendant –COOH with –OH
   (self-esterifies), –COOH with –NH (self-amidates), epoxide with a nucleophile, free isocyanate,
   peroxide, acyclic N–N.
+* **Heteroatom–halogen bonds** — N–F/N–Cl (N-haloamines are oxidising/halogenating *reagents*,
+  which is how NFSI and chloramine-T are made) and O–X (hypohalites). Added after a GA run
+  returned `*CCC1=CC(C(F)(F)F)=CC(C(F)(F)OC)=C1N(*)F`, a backbone N–F that the review passed
+  silently. The delicate part is precision, not detection: **C–F must never be flagged**, since
+  it is the whole point of PTFE, PVDF and every low-index fluoropolymer, and sulfonyl fluoride
+  (–SO₂F, the Nafion precursor) is perfectly stable, so sulfur is excluded. Measured on 600
+  fresh GA structures of which 143 contain fluorine: **0 false positives**.
+  `tests/test_chem_review.py` pins both halves.
 * **Tg/Tm consistency** — Tg must be below Tm for a semi-crystalline polymer, plus the
   Boyer–Beaman Tg/Tm ≈ 0.5–0.8 (K) sanity range.
 * **Architecture** — >2 connection points means a branch/crosslink junction, so linear-chain

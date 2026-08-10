@@ -193,6 +193,25 @@ def review(smi, preds=None, blend_context=None):
                     "topic": "stability",
                     "message": "acyclic N-N bond: usually thermally labile"})
 
+    # --- heteroatom-halogen bonds ---------------------------------------------------------
+    # An N-halogen bond makes an N-haloamine (N-F, N-Cl ...), which is an oxidising /
+    # halogenating REAGENT -- NFSI and chloramine-T are made this way -- not something that
+    # survives as a repeat unit. O-halogen is a hypohalite and is worse.
+    #
+    # These SMARTS deliberately match the HETEROATOM-halogen bond only. C-F must never be
+    # flagged: it is the entire point of PTFE, PVDF and every low-index fluoropolymer. S is
+    # excluded too, because sulfonyl fluoride (-SO2F) is perfectly stable and industrially
+    # important -- it is the Nafion precursor.
+    if _count(mol, "[#7][F,Cl,Br,I]", caps):
+        out.append({"level": "error", "key": "cr_n_halogen", "args": {},
+                    "topic": "stability",
+                    "message": "N-halogen bond (N-F / N-Cl ...): N-haloamines are oxidising / "
+                               "halogenating reagents and would not survive as a repeat unit"})
+    if _count(mol, "[OX2][F,Cl,Br,I]", caps):
+        out.append({"level": "error", "key": "cr_o_halogen", "args": {},
+                    "topic": "stability",
+                    "message": "O-halogen bond (hypohalite): highly unstable, not a repeat unit"})
+
     # --- is a melting point even meaningful? ---
     amorph = likely_amorphous(smi)
     if preds.get("Tm") is not None and amorph:

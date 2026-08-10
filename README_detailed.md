@@ -173,6 +173,7 @@ python tests/test_retro.py          # retrosynthesis rules (fast)
 python tests/test_translations.py   # TR/EN coverage incl. retro route names
 python tests/test_app_results.py    # app results path (loads models)
 python tests/test_reproducibility.py # same seed -> same polymer across restarts (fast)
+python tests/test_chem_review.py     # stability flags, incl. N-F without flagging C-F (fast)
 ```
 
 Run them after touching `retro.py`, `smart_ga.py`, `app.py`, or `lang_dict.py`.
