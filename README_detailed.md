@@ -91,6 +91,15 @@ polymer** (improve an existing structure instead of starting fresh), **advanced 
 and **"stay in the model's confidence zone"** — off by default, because it trades novelty for
 prediction trustworthiness.
 
+The random seed reproduces a run **across restarts**, not just within a session. That is not
+free: `build_seed_smiles()` gathers base-polymer names into a set of *strings*, and Python
+randomises string hashing per process, so iterating that set unsorted produced a different
+starting population in every interpreter — the same seed then gave a different polymer after
+each app restart. Sorting the names fixes it at the source, which is preferable to pinning
+`PYTHONHASHSEED` (that would disable hash randomisation process-wide, a DoS mitigation, and
+would only paper over the ordering bug). `tests/test_reproducibility.py` guards it by building
+the population in child processes under three different hash seeds and demanding one answer.
+
 
 ## Deploying (Railway / any Docker host)
 
@@ -163,6 +172,7 @@ GitHub's 50 MB warning threshold. The models themselves *are* committed — the 
 python tests/test_retro.py          # retrosynthesis rules (fast)
 python tests/test_translations.py   # TR/EN coverage incl. retro route names
 python tests/test_app_results.py    # app results path (loads models)
+python tests/test_reproducibility.py # same seed -> same polymer across restarts (fast)
 ```
 
 Run them after touching `retro.py`, `smart_ga.py`, `app.py`, or `lang_dict.py`.

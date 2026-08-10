@@ -602,7 +602,13 @@ def build_seed_smiles(active_props, bias, n):
         if lvl in ("low", "high"):
             names.update(PROPERTY_PROFILES.get(prop, {}).get(lvl, []))
 
-    bases = [BASE_POLYMERS[nm] for nm in names if nm in BASE_POLYMERS]
+    # sorted() is load-bearing: `names` is a set of STRINGS, and Python randomises string
+    # hashing per process (PYTHONHASHSEED), so iterating it directly gives a different order
+    # in every run. That order feeds random.choice(bases) below, which meant the same GA seed
+    # produced a different polymer after every app restart -- reproducible within a session,
+    # not across restarts. Sorting makes the seed genuinely reproducible without having to
+    # disable hash randomisation globally.
+    bases = [BASE_POLYMERS[nm] for nm in sorted(names) if nm in BASE_POLYMERS]
     bases = [s for s in bases if is_valid_polymer_smiles(s)]
     if not bases:
         bases = [BASE_POLYMERS[nm] for nm in DEFAULT_DIVERSE if is_valid_polymer_smiles(BASE_POLYMERS[nm])]
