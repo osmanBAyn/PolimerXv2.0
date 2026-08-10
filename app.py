@@ -91,7 +91,6 @@ ENABLE_XTB = True         # in Manual Analysis, offer a GFN2-xTB quantum cross-c
 # so it comes before the sidebar language selector below.
 st.set_page_config(
     page_title="POLSEN",
-    page_icon="🧬",
 )
 
 # Session State'te dil ayarı yoksa TR olarak başlat
@@ -122,7 +121,7 @@ def tr_retro(text):
             return tr_retro(text[:-len(suf)]) + _(suf)
     return text
 
-st.sidebar.markdown("### 🌍 Dil / Language")
+st.sidebar.markdown("### Dil / Language")
 selected_lang = st.sidebar.selectbox(
     "Dil Seçimi / Select Language",
     ["TR", "EN"],
@@ -197,7 +196,7 @@ def predict_monomers_local(polymer_smiles):
         return f"{' . '.join(rule_monomers)} ({tag})"
     if ai_prediction:
         return f"{ai_prediction} (T5, unverified)"
-    return "Ayrıştırılamadı"
+    return _('not_decomposable')
 COMMON_SOLVENTS = {
     "n-Heksan (Apolar)": 7.3,
     "Dietil Eter": 7.4,
@@ -375,7 +374,7 @@ def load_critic_models():
             _force_single_thread(_m)
         return models
     except Exception as e:
-        st.error(f"⚠️ Model Yükleme Hatası! Lütfen 'tg_model.joblib', 'td_model.joblib' ve 'eps_model.joblib' dosyalarının mevcut olduğundan emin olun. Hata: {e}")
+        st.error(f"{_('err_model_load')} {e}")
         return None
 
 def run_ga_silent(models, generations, targets, active_props, initial_pop, ranges_dict):
@@ -689,7 +688,7 @@ MODEL_RELIABILITY = {
     'Refractive': 'high',
     'CTE': 'low', 'Recyclability': 'low',
 }
-RELIABILITY_BADGE = {'high': '🟢', 'medium': '🟡', 'low': '🟠', 'unreliable': '🔴'}
+RELIABILITY_BADGE = {'high': '[high]', 'medium': '[med]', 'low': '[low]', 'unreliable': '[unrel]'}
 
 # Physical unit shown next to each predicted value (empty = dimensionless).
 PROP_UNITS = {
@@ -915,12 +914,12 @@ AD_GOOD, AD_WARN = 0.55, 0.35
 def applicability(max_sim):
     """-> ('in'|'edge'|'out', emoji) from the nearest-training-set similarity."""
     if max_sim is None:
-        return 'edge', '🟡'
+        return 'edge', ''
     if max_sim >= AD_GOOD:
-        return 'in', '🟢'
+        return 'in', ''
     if max_sim >= AD_WARN:
-        return 'edge', '🟡'
-    return 'out', '🟠'
+        return 'edge', ''
+    return 'out', ''
 
 
 def cxSelfies(ind1, ind2):
@@ -1999,9 +1998,9 @@ def check_pubchem_availability(smiles: str):
             name_resp = requests.get(name_url, timeout=5)
             if name_resp.status_code == 200:
                 name_data = name_resp.json()
-                name = name_data["PropertyTable"]["Properties"][0].get("IUPACName", "Bilinmiyor")
+                name = name_data["PropertyTable"]["Properties"][0].get("IUPACName", _('unknown_val'))
             else:
-                name = "Bilinmiyor"
+                name = _('unknown_val')
                 
             return True, cid, name
         else:
@@ -2060,19 +2059,19 @@ def make_3d_view_with_reason(smiles):
         clean_smi = str(smiles).replace('*', '[H]')
         mol = Chem.MolFromSmiles(clean_smi)
         if mol is None:
-            return None, "SMILES geçersiz veya RDKit ile molekül oluşturulamadı."
+            return None, _('err_smiles_invalid')
         
         mol = Chem.AddHs(mol)
         if AllChem.EmbedMolecule(mol) != 0:
-            return None, "3D koordinatlar hesaplanamadı (Embed başarısız)."
+            return None, _('err_3d_embed')
         
         try:
             AllChem.MMFFOptimizeMolecule(mol)
         except:
-            return None, "3D yapı enerji optimizasyonunda başarısız."
+            return None, _('err_3d_optimize')
         
         if not _HAS_3D:
-            return None, "3D görüntüleyici bu sunucuda kurulu değil."
+            return None, _('err_3d_missing')
         mblock = Chem.MolToMolBlock(mol)
         view = py3Dmol.view(width=400, height=400)
         view.addModel(mblock, 'mol')
@@ -2086,7 +2085,7 @@ def make_3d_view_with_reason(smiles):
 def get_ai_interpretation(api_key, smiles, preds, targets, active_props):
     """Gemini API kullanarak polimer analizi yapar."""
     if not api_key:
-        return "⚠️ Analiz için lütfen sol menüden geçerli bir Google Gemini API Anahtarı giriniz."
+        return "Analiz için lütfen sol menüden geçerli bir Google Gemini API Anahtarı giriniz."
 
     try:
         import google.generativeai as genai   # lazy: only needed if the LLM feature is used
@@ -2122,7 +2121,7 @@ def get_ai_interpretation(api_key, smiles, preds, targets, active_props):
             return response.text
             
     except Exception as e:
-        return f"❌ AI Bağlantı Hatası: {str(e)}"
+        return f"AI Bağlantı Hatası: {str(e)}"
 
 def get_sa_score_local(p_smiles):
     """
@@ -2151,7 +2150,7 @@ def calculate_green_score(smiles, deg_val=None, reg_val=None):
     Puan: 1 (Çok Kötü/Kalıcı) - 10 (Mükemmel/Bozunabilir)
     """
     mol = Chem.MolFromSmiles(smiles.replace('*', '[H]'))
-    if not mol: return 0, "Hesaplanamadı", "#7f8c8d"
+    if not mol: return 0, _('not_calculable'), "#7f8c8d"
     
     score = 5.0 # Nötr 
     notes = []
@@ -2393,7 +2392,7 @@ def draw_retrosynthesis_grid(monomer_smiles_list):
 
 def get_ai_retrosynthesis_guide(api_key, polymer_smiles, monomer_info):
     """Gemini'den detaylı sentez rotası ister."""
-    if not api_key: return "⚠️ Detaylı sentez planı için API Key gerekli."
+    if not api_key: return "Detaylı sentez planı için API Key gerekli."
 
     try:
         import google.generativeai as genai   # lazy: only needed if the LLM feature is used
@@ -2422,15 +2421,17 @@ def get_ai_retrosynthesis_guide(api_key, polymer_smiles, monomer_info):
         return f"Hata: {str(e)}"
 
 class PDFReport(FPDF):
+    # Every string here goes through _(), so the PDF follows the language selector. It used
+    # to be hardcoded Turkish, which meant an EN user still got a Turkish report.
     def header(self):
         self.set_font('Arial', 'B', 15)
-        self.cell(0, 10, 'Polsen - Ar-Ge Proje Raporu', 0, 1, 'C')
+        self.cell(0, 10, clean_text(_('pdf_doc_title')), 0, 1, 'C')
         self.ln(5)
 
     def footer(self):
         self.set_y(-15)
         self.set_font('Arial', 'I', 8)
-        self.cell(0, 10, f'Sayfa {self.page_no()}', 0, 0, 'C')
+        self.cell(0, 10, clean_text(f"{_('pdf_page')} {self.page_no()}"), 0, 0, 'C')
 
 def clean_text(text):
     """FPDF için Türkçe karakterleri ASCII'ye çevirir (Hızlı çözüm)"""
@@ -2448,16 +2449,16 @@ def create_pdf_report(poly_data, targets, active_props, ai_analysis_text, retro_
     pdf.set_font("Arial", size=12)
 
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, clean_text("1. Genel Degerlendirme ve Skorlar"), 0, 1)
+    pdf.cell(0, 10, clean_text(_('pdf_s1')), 0, 1)
     pdf.set_font("Arial", size=10)
 
     # Toplam Hata
-    pdf.cell(50, 8, clean_text("Toplam Hata:"), 0, 0)
+    pdf.cell(50, 8, clean_text(_('pdf_total_error')), 0, 0)
     pdf.cell(0, 8, f"{poly_data['total_error']:.4f}", 0, 1)
 
     # Sentez Zorluğu (SA Score)
     sa_score = get_sa_score_local(poly_data['smiles'])
-    pdf.cell(50, 8, clean_text("Sentez Zorlugu (SA):"), 0, 0)
+    pdf.cell(50, 8, clean_text(_('pdf_sa')), 0, 0)
     pdf.cell(0, 8, f"{sa_score:.2f} / 10", 0, 1)
 
     # Yeşil Skor
@@ -2465,32 +2466,32 @@ def create_pdf_report(poly_data, targets, active_props, ai_analysis_text, retro_
     de_val = preds.get('Degradability')
     reg_val = preds.get('Recyclability')
     g_score, g_note, _color = calculate_green_score(poly_data['smiles'], deg_val=de_val, reg_val=reg_val)
-    pdf.cell(50, 8, clean_text("Yesil Skor:"), 0, 0)
+    pdf.cell(50, 8, clean_text(_('pdf_green')), 0, 0)
     pdf.cell(0, 8, f"{g_score:.1f} / 10 ({clean_text(g_note)})", 0, 1)
 
     # Çözünürlük Analizi
     if 'Hansen' in preds:
         sol_val = preds['Hansen']
         solvents, partials = get_soluble_solvents(sol_val)
-        pdf.cell(50, 8, clean_text("Hansen Cozunurluk:"), 0, 0)
+        pdf.cell(50, 8, clean_text(_('pdf_hansen')), 0, 0)
         pdf.cell(0, 8, f"{sol_val:.2f}", 0, 1)
         if solvents:
-            pdf.cell(50, 8, clean_text("Tam Cozundugu:"), 0, 0)
+            pdf.cell(50, 8, clean_text(_('pdf_soluble')), 0, 0)
             pdf.multi_cell(0, 8, clean_text(", ".join(solvents)))
         if partials:
-            pdf.cell(50, 8, clean_text("Sistigi/Kismen:"), 0, 0)
+            pdf.cell(50, 8, clean_text(_('pdf_swelling')), 0, 0)
             pdf.multi_cell(0, 8, clean_text(", ".join(partials)))
 
     pdf.ln(5)
     
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, clean_text("1. Polimer Özellik Tablosu"), 0, 1)
+    pdf.cell(0, 10, clean_text(_('pdf_s2')), 0, 1)
     pdf.set_font("Arial", size=10)
-    
+
     pdf.set_fill_color(200, 220, 255)
-    pdf.cell(60, 8, "Ozellik", 1, 0, 'C', 1)
-    pdf.cell(60, 8, "Hedef", 1, 0, 'C', 1)
-    pdf.cell(60, 8, "Tahmin Degeri", 1, 1, 'C', 1)
+    pdf.cell(60, 8, clean_text(_('pdf_col_prop')), 1, 0, 'C', 1)
+    pdf.cell(60, 8, clean_text(_('pdf_col_target')), 1, 0, 'C', 1)
+    pdf.cell(60, 8, clean_text(_('pdf_col_pred')), 1, 1, 'C', 1)
     
     all_preds = poly_data['preds']
     
@@ -2508,7 +2509,7 @@ def create_pdf_report(poly_data, targets, active_props, ai_analysis_text, retro_
     pdf.ln(10)
     
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, clean_text("2. Molekuler Yapi"), 0, 1)
+    pdf.cell(0, 10, clean_text(_('pdf_s3')), 0, 1)
     
     pdf.set_font("Courier", size=8)
     pdf.multi_cell(0, 5, poly_data['smiles'])
@@ -2523,11 +2524,11 @@ def create_pdf_report(poly_data, targets, active_props, ai_analysis_text, retro_
     pdf.ln(10)
     
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, clean_text("3. Uretim Plani (Retrosentez)"), 0, 1)
+    pdf.cell(0, 10, clean_text(_('pdf_s4')), 0, 1)
     pdf.set_font("Arial", size=10)
-    
+
     if not retro_info or len(retro_info) < 5:
-        pdf.multi_cell(0, 6, clean_text("Retrosentez analizi yapilmadi veya veri yok."))
+        pdf.multi_cell(0, 6, clean_text(_('pdf_no_retro')))
     else:
         clean_retro = clean_text(str(retro_info))
         pdf.multi_cell(0, 6, clean_retro)
@@ -2535,11 +2536,11 @@ def create_pdf_report(poly_data, targets, active_props, ai_analysis_text, retro_
     pdf.ln(10)
     
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, clean_text("4. Yapay Zeka Uzman Görüşü"), 0, 1)
+    pdf.cell(0, 10, clean_text(_('pdf_s5')), 0, 1)
     pdf.set_font("Arial", size=10)
-    
+
     if not ai_analysis_text or len(ai_analysis_text) < 5:
-        pdf.multi_cell(0, 6, clean_text("AI analizi talep edilmedi."))
+        pdf.multi_cell(0, 6, clean_text(_('pdf_no_ai')))
     else:
         clean_ai = clean_text(ai_analysis_text).replace('**', '').replace('#', '')
         pdf.multi_cell(0, 6, clean_ai)
@@ -2561,7 +2562,7 @@ def get_reference_fingerprints(smiles_list):
             if mol:
                 fp = AllChem.GetMorganFingerprintAsBitVect(mol, 3, 2048)
                 fps.append(fp)
-                names.append(f"Veri Seti Kaydı #{i+1}") 
+                names.append(f"{_('dataset_record')} #{i+1}")
         except:
             continue
     return fps, names
@@ -2571,19 +2572,19 @@ def calculate_novelty_optimized(generated_smiles, ref_smiles_list):
     Toplu Tanimoto benzerliği hesaplar.
     """
     gen_mol = Chem.MolFromSmiles(generated_smiles.replace('*', '[H]'))
-    if not gen_mol: return 0.0, "Hesaplanamadı"
+    if not gen_mol: return 0.0, _('not_calculable')
     gen_fp = AllChem.GetMorganFingerprintAsBitVect(gen_mol, 3, 2048)
     
     ref_fps, ref_names = get_reference_fingerprints(ref_smiles_list)
     
-    if not ref_fps: return 0.0, "Veri Seti Boş"
+    if not ref_fps: return 0.0, _('dataset_empty')
     
     sims = DataStructs.BulkTanimotoSimilarity(gen_fp, ref_fps)
     
     max_sim = max(sims)
     max_idx = sims.index(max_sim)
     most_similar_name = ref_names[max_idx]
-    most_similar_smiles = ref_smiles_list[max_idx] if max_idx < len(ref_smiles_list) else "Bilinmiyor"
+    most_similar_smiles = ref_smiles_list[max_idx] if max_idx < len(ref_smiles_list) else _('unknown_val')
     
     return max_sim, most_similar_smiles
 
@@ -2599,7 +2600,7 @@ ALL_PROPS = list(models.keys())
 
 # --- Manual polymer analysis (predict properties + retrosynthesis for a user SMILES) ---
 if models and SHOW_MANUAL_ANALYSIS:
-    with st.expander(f"🧪 {_('manual_title')}", expanded=False):
+    with st.expander(f"{_('manual_title')}", expanded=False):
         st.caption(f"{_('manual_desc')}")
         mcol_in, mcol_btn = st.columns([4, 1])
         with mcol_in:
@@ -2619,7 +2620,7 @@ if models and SHOW_MANUAL_ANALYSIS:
         if _asmi:
             _mmol = Chem.MolFromSmiles(str(_asmi).replace('*', '[H]'))
             if _mmol is None:
-                st.error(f"❌ {_('manual_invalid')}")
+                st.error(f"{_('manual_invalid')}")
             else:
                 m_preds = compute_preds(_asmi, models, ALL_PROPS) or {}
                 mc_struct, mc_props = st.columns([1, 2])
@@ -2650,8 +2651,8 @@ if models and SHOW_MANUAL_ANALYSIS:
                 _routes = retro.retro_decompose(_asmi)
                 if _routes:
                     _r = _routes[0]
-                    _vf = "🔬" if _r.get('verified', False) else "⚠️"
-                    _rex = {True: f" · ✅ {_('retro_exact')}", False: f" · ≈ {_('retro_approx')}"}.get(_r.get('exact'), "")
+                    _vf = f"[{_('retro_verified')}]" if _r.get('verified', False) else f"[{_('retro_tentative_tag')}]"
+                    _rex = {True: f" · {_('retro_exact')}", False: f" · ≈ {_('retro_approx')}"}.get(_r.get('exact'), "")
                     st.info(f"{_vf} **{_('yontem')}:** {tr_retro(_r['type'])}  |  {tr_retro(_r['mechanism'])}{_rex}")
                     _img_r = draw_retrosynthesis_grid(_r['monomers'])
                     if _img_r is not None:
@@ -2660,11 +2661,11 @@ if models and SHOW_MANUAL_ANALYSIS:
                         st.code(f"Monomer {_i+1}: {_m}")
                         _ok, _cid, _nm, _url = lookup_monomer(_m)
                         if _ok:
-                            st.markdown(f"&nbsp;&nbsp;✅ [{_nm or ('CID ' + str(_cid))}]({_url}) "
+                            st.markdown(f"&nbsp;&nbsp;[{_nm or ('CID ' + str(_cid))}]({_url}) "
                                         f"<span style='opacity:.6;font-size:.85em'>CID {_cid}</span>",
                                         unsafe_allow_html=True)
                         else:
-                            st.markdown(f"&nbsp;&nbsp;❔ {_('kayitli_degil')} — [{_('pubchem_search')}]({_url})")
+                            st.markdown(f"&nbsp;&nbsp;{_('kayitli_degil')} — [{_('pubchem_search')}]({_url})")
                 else:
                     st.warning(f"{_('retro_auto_failed')}")
 
@@ -2684,17 +2685,17 @@ if models and SHOW_MANUAL_ANALYSIS:
                             _mx_smi = None
                     if _xtbt and _xexe and _mx_smi:
                         st.divider()
-                        st.markdown(f"**🔬 {_('xtb_header')}**")
+                        st.markdown(f"**{_('xtb_header')}**")
                         st.caption(_('xtb_desc'))
                         if str(_asmi).count('*') > 2:
-                            st.caption(f"ℹ️ {_('verify_branched')}")
-                        if st.button(f"🔬 {_('xtb_btn')}", key="manual_xtb_btn"):
+                            st.caption(f"{_('verify_branched')}")
+                        if st.button(f"{_('xtb_btn')}", key="manual_xtb_btn"):
                             with st.spinner(_('xtb_running')):
                                 st.session_state['manual_xtb'] = _xtbt.crosscheck_one(_mx_smi, _xexe)
                         _xr = st.session_state.get('manual_xtb')
                         if _xr:
                             if _xr.get('gap_inf') is None and _xr.get('alpha_vol') is None:
-                                st.warning(f"⚠️ {_('xtb_failed')}: {_xr.get('error', '')}")
+                                st.warning(f"{_('xtb_failed')}: {_xr.get('error', '')}")
                             else:
                                 _xc1, _xc2 = st.columns(2)
                                 with _xc1:
@@ -2721,7 +2722,7 @@ if models and SHOW_MANUAL_ANALYSIS:
 
 # --- MANUEL POLİMER TAHMİN BÖLÜMÜ BAŞLANGICI ---
 # st.divider()
-# with st.expander("🧪 Manuel Polimer SMILES Analizi", expanded=False):
+# with st.expander("Manuel Polimer SMILES Analizi", expanded=False):
 #     st.markdown("Genetik algoritmayı çalıştırmadan, kendi polimerinizin özelliklerini hızlıca tahmin edin.")
     
 #     col_input, col_btn = st.columns([4, 1])
@@ -2736,7 +2737,7 @@ if models and SHOW_MANUAL_ANALYSIS:
 #         # Molekülün geçerliliğini kontrol et
 #         mol = Chem.MolFromSmiles(manual_smiles.replace('*', '[H]'))
 #         if mol is None:
-#             st.error("❌ Geçersiz SMILES Kodu! Lütfen kimyasal sözdizimini kontrol ediniz.")
+#             st.error("Geçersiz SMILES Kodu! Lütfen kimyasal sözdizimini kontrol ediniz.")
 #         else:
 #             with st.spinner("Yapay Zeka Modelleri özellikleri hesaplıyor..."):
 #                 # 1. Özellik Çıkarımı (Feature Extraction)
@@ -2762,7 +2763,7 @@ if models and SHOW_MANUAL_ANALYSIS:
 #                     else:
 #                         manual_preds[prop] = 0.0
                 
-#                 st.success("✅ Tahmin başarıyla tamamlandı!")
+#                 st.success("Tahmin başarıyla tamamlandı!")
 
 #                 # 3. Sonuçları Ekrana Çizdirme
 #                 m_col1, m_col2 = st.columns([1, 2])
@@ -2788,7 +2789,7 @@ if models and SHOW_MANUAL_ANALYSIS:
 #                     """, unsafe_allow_html=True)
 
 #                 with m_col2:
-#                     st.markdown("#### 📊 Makine Öğrenmesi Tahminleri")
+#                     st.markdown("#### Makine Öğrenmesi Tahminleri")
 #                     pred_cols = st.columns(3)
                     
 #                     # Uygulamanızın kendi CSS Metric Card yapısını kullanarak özellikleri diziyoruz
@@ -2886,7 +2887,7 @@ if models:
     # Warn if the user is optimising toward a property whose model is unreliable.
     _weak = [p for p in active_props if MODEL_RELIABILITY.get(p) == 'unreliable'] if SHOW_RELIABILITY else []
     if _weak:
-        st.sidebar.warning(f"🔴 {_('warn_unreliable')} {', '.join(_weak)}")
+        st.sidebar.warning(f"{_('warn_unreliable')} {', '.join(_weak)}")
 
     st.sidebar.markdown(f'### {_("sidebar_target_values")}')
     targets = {}
@@ -2944,7 +2945,7 @@ if models:
     stay_in_domain = st.sidebar.checkbox(f'{_("stay_in_domain")}', value=False,
                                          help=f'{_("stay_in_domain_help")}')
     if stay_in_domain:
-        st.sidebar.caption(f"⚖️ {_('stay_in_domain_note')}")
+        st.sidebar.caption(f"{_('stay_in_domain_note')}")
     seed_val = st.sidebar.number_input(f'{_("random_seed")}', min_value=0, max_value=999999,
                                        value=0, step=1, help=f'{_("random_seed_help")}')
 
@@ -2958,13 +2959,13 @@ if models:
         if _s_ok:
             start_selfies = smiles_to_selfies_safe(start_smiles.strip())
         if not _s_ok or not start_selfies:
-            st.sidebar.warning(f'⚠️ {_("start_from_invalid")}')
+            st.sidebar.warning(f'{_("start_from_invalid")}')
             start_selfies = None
         else:
-            st.sidebar.success(f'✅ {_("start_from_ok")}')
+            st.sidebar.success(f'{_("start_from_ok")}')
 
     # Advanced GA hyperparameters (mutation/crossover probabilities, population, etc.)
-    with st.sidebar.expander(f"⚙️ {_('ga_params_title')}", expanded=False):
+    with st.sidebar.expander(f"{_('ga_params_title')}", expanded=False):
         _d = _ga_param_defaults()
         ga_params = {
             'pop_size': st.slider(f"{_('ga_pop_size')}", 20, 400, _d['pop_size'], step=4,
@@ -3070,7 +3071,7 @@ if models:
         # If the run started from the user's own polymer, show what the GA improved.
         _from_smi = st.session_state.get('ga_started_from')
         if _from_smi:
-            with st.expander(f"🔁 {_('start_from_compare')}", expanded=False):
+            with st.expander(f"{_('start_from_compare')}", expanded=False):
                 _from_preds = compute_preds(_from_smi, models, saved_active_props) or {}
                 st.caption(f"`{_from_smi}`  →  `{best_poly_data['smiles']}`")
                 _rows = []
@@ -3085,7 +3086,7 @@ if models:
                         _('start_from_before'): round(_b, 2),
                         _('start_from_after'): round(_a, 2),
                         _('target'): (f"{_t:.2f}" if _t is not None else "—"),   # str, not mixed
-                        "": "✅" if _closer else ("→" if _closer is None else "⚠️"),
+                        "": (_('cmp_better') if _closer else (_('cmp_same') if _closer is None else _('cmp_worse'))),
                     })
                 if _rows:
                     st.dataframe(pd.DataFrame(_rows), hide_index=True, width='stretch')
@@ -3093,7 +3094,7 @@ if models:
         _tab_labels = [f"{_('tab_general')}", f"{_('tab_structural')}", f"{_('tab_evolution')}",
                        f"{_('tab_report')}", f"{_('tab_retro')}"]
         if SHOW_BLENDS:
-            _tab_labels.append(f"🧪 {_('tab_blend')}")
+            _tab_labels.append(f"{_('tab_blend')}")
         _tabs = st.tabs(_tab_labels)
         tab1, tab2, tab3, tab4, tab6 = _tabs[0], _tabs[1], _tabs[2], _tabs[3], _tabs[4]
         tab_blend = _tabs[5] if SHOW_BLENDS else None
@@ -3136,7 +3137,7 @@ if models:
                     st.info(f"**{_('soluble_in')}**")
                     if solvents:
                         for s in solvents:
-                            st.markdown(f"- ✅ {s}")
+                            st.markdown(f"- {s}")
                     else:
                         st.warning(f"{_('no_solubility')}")
                 
@@ -3144,7 +3145,7 @@ if models:
                     st.warning(f"**{_('swelling_in')}**")
                     if partials:
                         for s in partials:
-                            st.markdown(f"- ⚠️ {s}")
+                            st.markdown(f"- {s}")
                     else:
                         st.write("-")
                 
@@ -3163,10 +3164,10 @@ if models:
             if SHOW_APPLICABILITY:
                 if _ad_state != 'in':
                     _ad_msg = _('ad_warn_edge') if _ad_state == 'edge' else _('ad_warn_out')
-                    st.warning(f"{_ad_icon} **{_('ad_title')}** — {_ad_msg}"
+                    st.warning(f"**{_('ad_title')}** — {_ad_msg}"
                                + (f"  \n*{_('ad_similarity')}: {_ad_sim:.2f}*" if _ad_sim is not None else ""))
                 elif _ad_sim is not None:
-                    st.caption(f"{_ad_icon} {_('ad_title')}: {_('ad_ok')} ({_('ad_similarity')}: {_ad_sim:.2f})")
+                    st.caption(f"{_('ad_title')}: {_('ad_ok')} ({_('ad_similarity')}: {_ad_sim:.2f})")
 
             if SHOW_RELIABILITY:
                 st.caption(f"{_('reliability_legend')}")
@@ -3218,19 +3219,18 @@ if models:
                     _notes = []
                 if _notes:
                     _ne, _nw, _ni = _cr.summary(_notes)
-                    _hdr = f"🧑‍🔬 {_('chem_review_title')}"
+                    _hdr = f"{_('chem_review_title')}"
                     if _ne:
-                        _hdr += f" — ❌ {_ne}"
+                        _hdr += f" — {_ne} {_('chem_n_errors')}"
                     if _nw:
-                        _hdr += f" — ⚠️ {_nw}"
+                        _hdr += f" — {_nw} {_('chem_n_warnings')}"
                     with st.expander(_hdr, expanded=bool(_ne)):
                         st.caption(_('chem_review_desc'))
                         for _nt in _notes:
-                            _ic = {"error": "❌", "warn": "⚠️", "info": "ℹ️"}[_nt["level"]]
                             # chem_review.py is UI-agnostic: translate via its key when present
                             _msg = (_(_nt["key"]).format(**(_nt.get("args") or {}))
                                     if _nt.get("key") else _nt["message"])
-                            _txt = f"{_ic} **{_nt['topic']}** — {_msg}"
+                            _txt = f"**{_nt['topic']}** — {_msg}"
                             (st.error if _nt["level"] == "error" else
                              st.warning if _nt["level"] == "warn" else st.info)(_txt)
 
@@ -3240,7 +3240,7 @@ if models:
             _top = best_poly_data.get('top') or []
             if TOP_N_CANDIDATES and len(_top) > 1:
                 st.divider()
-                with st.expander(f"🥈 {_('topn_title')} ({len(_top)})", expanded=False):
+                with st.expander(f"{_('topn_title')} ({len(_top)})", expanded=False):
                     st.caption(_('topn_desc'))
                     _rows = []
                     for _i, _c in enumerate(_top, 1):
@@ -3255,8 +3255,8 @@ if models:
                                 _row[f"{_p}{f' ({_u})' if _u else ''}"] = round(_cp[_p], 2)
                         # always present: a column that exists on only SOME rows becomes
                         # str+NaN, which Arrow cannot serialise
-                        _row["★"] = ("⭐" if "knee" in _c.get('tag', '')
-                                     else "🎯" if "min-error" in _c.get('tag', '') else "")
+                        _row[_('topn_tag')] = (_('tag_knee') if "knee" in _c.get('tag', '')
+                                     else _('tag_minerr') if "min-error" in _c.get('tag', '') else "")
                         _rows.append(_row)
                     st.dataframe(pd.DataFrame(_rows), hide_index=True, width='stretch')
                     _imgs = [draw_2d_molecule(_c['smiles']) for _c in _top[:6]]
@@ -3267,7 +3267,7 @@ if models:
                             with _icols[_k % len(_icols)]:
                                 st.image(_im, caption=f"#{_n}", width='stretch')
                     st.download_button(
-                        f"⬇️ {_('topn_download')}",
+                        f"{_('topn_download')}",
                         data=pd.DataFrame(_rows).to_csv(index=False).encode('utf-8'),
                         file_name="polsen_top_candidates.csv", mime="text/csv",
                         key="topn_csv")
@@ -3306,11 +3306,11 @@ if models:
                         _xtb_smi = None
                 if _vk or (_xtbt and _vexe):
                     st.divider()
-                    st.subheader(f"🔬 {_('verify_title')}")
+                    st.subheader(f"{_('verify_title')}")
                     st.caption(_('verify_desc'))
                     if _ver_smi.count('*') > 2:
-                        st.caption(f"ℹ️ {_('verify_branched')}")
-                    if st.button(f"🔬 {_('verify_btn')}", key="verify_xtb_btn"):
+                        st.caption(f"{_('verify_branched')}")
+                    if st.button(f"{_('verify_btn')}", key="verify_xtb_btn"):
                         _checks = []
                         if _xtbt and _vexe and _xtb_smi:
                             with st.spinner(_('xtb_running')):
@@ -3331,7 +3331,7 @@ if models:
                         if not _checks:
                             st.info(_('verify_none'))
                         else:
-                            _vicon = {'ok': '✅', 'warn': '⚠️', 'bad': '❌'}
+                            _vicon = {'ok': 'ok', 'warn': 'borderline', 'bad': 'diverges'}
                             _vcols = st.columns(len(_checks))
                             for _ci, _chk in enumerate(_checks):
                                 with _vcols[_ci]:
@@ -3367,7 +3367,7 @@ if models:
                 if selfies_str:
                     st.code(selfies_str, language="text")
                 else:
-                    st.warning("SELFIES formatına dönüştürülemedi.")
+                    st.warning(_('warn_no_selfies'))
             with col_3d:
                 st.subheader(f"{_('3d_structure')}")
                 view, reason = make_3d_view_with_reason(best_poly_data["smiles"])
@@ -3375,7 +3375,7 @@ if models:
                     if _HAS_3D:
                         showmol(view, height=400, width=400)
                 else:
-                    st.warning(f"3D Model oluşturulamadı: {reason}")
+                    st.warning(f"{_('err_3d_generic')}: {reason}")
             
             is_avail, cid, name = check_pubchem_availability(best_poly_data['smiles'])
             if is_avail:
@@ -3437,7 +3437,7 @@ if models:
 
                 """)
             else:
-                st.warning("Henüz grafik çizilecek veri yok.")
+                st.warning(_('warn_no_chart_data'))
 
             # --- Pareto front (only when NSGA-II was used) ---
             pareto = st.session_state.get('ga_pareto') if SHOW_PARETO_TABLE else None
@@ -3445,11 +3445,11 @@ if models:
                 st.divider()
                 st.subheader(f"{_('pareto_front')}")
                 st.caption(f"{_('pareto_desc')}")
-                st.info(f"⭐ {_('knee_note')}")
+                st.info(f"{_('knee_note')}")
 
                 rows = []
                 for i, sol in enumerate(pareto):
-                    mark = "⭐" if "knee" in sol.get("tag", "") else ("🎯" if "min-error" in sol.get("tag", "") else "")
+                    mark = _('tag_knee') if "knee" in sol.get("tag", "") else (_('tag_minerr') if "min-error" in sol.get("tag", "") else "")
                     row = {_("col_pick"): mark, "#": i + 1, "SMILES": sol["smiles"]}
                     for prop in saved_active_props:
                         _col = f"{prop} ({prop_unit(prop)})" if prop_unit(prop) else prop
@@ -3478,7 +3478,7 @@ if models:
                     if knee:
                         axp.scatter([knee["preds"].get(p1)], [knee["preds"].get(p2)],
                                     c='#f1c40f', marker='D', s=160, zorder=5, edgecolors='black',
-                                    label=f"⭐ {_('knee_point')}")
+                                    label=f"{_('knee_point')}")
                     axp.set_xlabel(p1)
                     axp.set_ylabel(p2)
                     axp.set_title(f"{_('pareto_front')}: {p1} vs {p2}", fontweight='bold')
@@ -3566,7 +3566,7 @@ if models:
             #     with st.spinner("Model zorlu bir sınava giriyor... Kahvenizi alın, bu biraz sürebilir."):
             #         df_results = run_mass_random_test(models, generations, initial_selfies, ranges, num_trials=mass_trials)
                     
-            #         st.subheader(" Test Sonuçları 📊")
+            #         st.subheader(" Test Sonuçları ")
                     
             #         avg_error = df_results["Final Hata Skoru"].mean()
             #         success_count = df_results[df_results["Final Hata Skoru"] < 5.0].shape[0]
@@ -3597,7 +3597,7 @@ if models:
             #         ax_sc.grid(True, alpha=0.3)
             #         st.pyplot(fig_sc)
                     
-            #         with st.expander("📄 Tüm Test Verilerini Gör"):
+            #         with st.expander("Tüm Test Verilerini Gör"):
             #             st.dataframe(df_results)
 
         # --- Blend / alloy tab ------------------------------------------------------------
@@ -3605,7 +3605,7 @@ if models:
         # toughened blends. Blend this result with a commodity polymer or another candidate.
         if SHOW_BLENDS and tab_blend is not None:
             with tab_blend:
-                st.header(f"🧪 {_('blend_header')}")
+                st.header(f"{_('blend_header')}")
                 st.caption(_('blend_desc'))
                 try:
                     import blends as _bl
@@ -3647,7 +3647,7 @@ if models:
                                 preds_a=_pa2, preds_b=_pb2, basis="weight",
                                 predict_fn=lambda u: compute_preds(u, models, ALL_PROPS))
                             if _cres:
-                                st.subheader(f"🔗 {_(f'blend_mode_{_mode}')}  "
+                                st.subheader(f"{_(f'blend_mode_{_mode}')}  "
                                              f"({_wfrac:.0%} / {1-_wfrac:.0%} w/w)")
                                 if _cres.get("unit"):
                                     st.caption(_('copo_built_unit'))
@@ -3672,7 +3672,7 @@ if models:
                                     st.dataframe(pd.DataFrame(_crows), hide_index=True,
                                                  width='stretch')
                                     st.download_button(
-                                        f"⬇️ {_('blend_download')}",
+                                        f"{_('blend_download')}",
                                         data=pd.DataFrame(_crows).to_csv(index=False).encode('utf-8'),
                                         file_name="polsen_copolymer.csv", mime="text/csv",
                                         key="copo_csv")
@@ -3683,12 +3683,10 @@ if models:
                         _res = _bl.blend_properties([_pa, _pb], [_wfrac, 1 - _wfrac])
                         if _res:
                             _m = _res["miscibility"]
-                            _icon = {"miscible": "🟢", "borderline": "🟡",
-                                     "immiscible": "🟠"}.get(_m["verdict"], "⚪")
                             # blends.py is UI-agnostic and returns translation KEYS; look them
                             # up here so the whole tab follows the selected language
                             _verdict = _(f"blend_misc_{_m['verdict']}")
-                            st.subheader(f"{_icon} {_('blend_miscibility')}: {_verdict}")
+                            st.subheader(f"{_('blend_miscibility')}: {_verdict}")
                             _ra = f"{_m['Ra']:.1f}" if _m.get("Ra") is not None else "-"
                             st.caption(f"Hansen Ra = {_ra} MPa^½ · χ ≈ "
                                        f"{_m['chi']:.2f} · {_('blend_confidence')}: {_m['confidence']}"
@@ -3720,14 +3718,14 @@ if models:
                             st.dataframe(pd.DataFrame(_rows), hide_index=True,
                                          width='stretch')
                             st.download_button(
-                                f"⬇️ {_('blend_download')}",
+                                f"{_('blend_download')}",
                                 data=pd.DataFrame(_rows).to_csv(index=False).encode('utf-8'),
                                 file_name="polsen_blend.csv", mime="text/csv", key="blend_csv")
                     elif _custom.strip():
-                        st.warning(f"⚠️ {_('start_from_invalid')}")
+                        st.warning(f"{_('start_from_invalid')}")
 
         with tab4:
-            st.header(f"💾 {_('report_header')}")
+            st.header(f"{_('report_header')}")
             st.markdown(f"{_('report_desc')}")
             
             c1, c2 = st.columns(2)
@@ -3735,7 +3733,7 @@ if models:
             # --- flat CSV (one row): value + unit + measured error + target, per property ---
             export_dict = {
                 "SMILES": best_poly_data['smiles'],
-                "Toplam Hata": best_poly_data['total_error'],
+                _('csv_total_error'): best_poly_data['total_error'],
                 "SA Score": get_sa_score_local(best_poly_data['smiles']),
             }
             _ad_sim_x = st.session_state.get('ad_sim')
@@ -3877,7 +3875,7 @@ if models:
                 )
             with c2:
                 st.download_button(
-                    label=f"📄 {_('btn_download_report')}",
+                    label=f"{_('btn_download_report')}",
                     data=_build_text_report().encode('utf-8'),
                     file_name="polsen_report.txt",
                     mime="text/plain"
@@ -3888,12 +3886,12 @@ if models:
             st.subheader(f"{_('pdf_report')}")
             st.info(f"{_('pdf_report_info')}")
 
-            gen_ai_analysis = st.session_state.get('ai_analysis', "Genel AI analizi yapilmadi.")
-            
-            manual_retro = st.session_state.get('retro_manual_text', "Otomatik ayristirma verisi yok (Retrosentez sekmesini ziyaret edin).")
-            ai_retro = st.session_state.get('ai_retro_text', "AI sentez recetesi olusturulmadi.")
-            
-            full_retro_info = manual_retro + "\n\n--- AI Sentez Notlari ---\n" + ai_retro
+            gen_ai_analysis = st.session_state.get('ai_analysis', _('report_no_ai'))
+
+            manual_retro = st.session_state.get('retro_manual_text', _('report_no_retro'))
+            ai_retro = st.session_state.get('ai_retro_text', _('report_no_ai_retro'))
+
+            full_retro_info = manual_retro + f"\n\n--- {_('report_ai_notes')} ---\n" + ai_retro
 
             if st.button(f"{_('btn_create_pdf')}", type="primary", width='stretch'):
                 with st.spinner(f"{_('report_getting_ready')}..."):
@@ -3907,9 +3905,9 @@ if models:
                     
                     st.success(f"{_('report_ready')}")
                     st.download_button(
-                        label=f"📥 {_('download')} {_('pdf_report')}",
+                        label=f"{_('download')} {_('pdf_report')}",
                         data=pdf_data,
-                        file_name="PolimerX_Final_Raporu.pdf",
+                        file_name=_('pdf_filename'),
                         mime="application/pdf",
                         width='stretch'
                     )
@@ -3954,13 +3952,13 @@ if models:
                 st.info(f"**{_('yontem')}:** {tr_retro(route['type'])}")
                 st.write(f"**{_('mechanism')}:** {tr_retro(route['mechanism'])}")
                 if route.get('verified', False):
-                    st.caption(f"🔬 {_('retro_rule_method')}")
+                    st.caption(f"{_('retro_rule_method')}")
                 else:
-                    st.caption(f"⚠️ {_('retro_tentative')}")
+                    st.caption(f"{_('retro_tentative')}")
                 # round-trip: does re-polymerising the monomer reproduce THIS repeat unit?
                 _exact = route.get('exact')
                 if _exact is True:
-                    st.success(f"✅ {_('retro_exact')}")
+                    st.success(f"{_('retro_exact')}")
                 elif _exact is False:
                     st.info(f"≈ {_('retro_approx')}")
 
@@ -3981,12 +3979,12 @@ if models:
                         _ok, _cid, _nm, _url = lookup_monomer(m)
                         if _ok:
                             st.markdown(
-                                f"✅ [{_nm or ('CID ' + str(_cid))}]({_url}) "
+                                f"[{_nm or ('CID ' + str(_cid))}]({_url}) "
                                 f"<span style='opacity:.6;font-size:.85em'>CID {_cid}</span>",
                                 unsafe_allow_html=True)
                             found_monomers.append(f"{_nm or _cid} (CID {_cid})")
                         else:
-                            st.markdown(f"❔ {_('kayitli_degil')} — [{_('pubchem_search')}]({_url})")
+                            st.markdown(f"{_('kayitli_degil')} — [{_('pubchem_search')}]({_url})")
 
                 if found_monomers:
                     monomer_info_text += f"{_('kayitli')}: {', '.join(found_monomers)}"
@@ -3998,7 +3996,7 @@ if models:
                     br = named[0]
                     st.info(f"**{_('yontem')}:** {br['type']}")
                     st.write(f"**{_('mechanism')}:** {br['mechanism']}")
-                    st.caption(f"⚠️ {_('retro_named_only')}")
+                    st.caption(f"{_('retro_named_only')}")
                     monomer_info_text = f"{_('yontem')}: {br['type']}\n{_('mechanism')}: {br['mechanism']}"
                 else:
                     st.warning(f"{_('retro_auto_failed')}")
